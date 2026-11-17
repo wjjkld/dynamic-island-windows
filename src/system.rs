@@ -33,6 +33,19 @@ pub fn battery() -> Option<Battery> {
     })
 }
 
+/// 用电池时预计还能用多少秒；插着电或系统还没估算出来时返回 None。
+pub fn battery_time() -> Option<u32> {
+    let mut s = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut s).ok()? };
+    (s.ACLineStatus == 0 && s.BatteryLifeTime != u32::MAX && s.BatteryLifeTime > 0).then_some(s.BatteryLifeTime)
+}
+
+/// 剩余时间的文字。
+pub fn fmt_left(secs: u32) -> String {
+    let m = secs / 60;
+    if m >= 60 { format!("剩余 {} 小时 {} 分", m / 60, m % 60) } else { format!("剩余 {m} 分钟") }
+}
+
 /// 有全屏应用（游戏、全屏视频、演示）时让位。
 /// SHQueryUserNotificationState 的 QUNS_BUSY 误报很多，只信独占全屏和演示模式，
 /// 其余情况自己判断：前台窗口是否盖满岛所在的显示器。

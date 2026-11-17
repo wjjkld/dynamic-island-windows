@@ -46,6 +46,7 @@ impl Rect {
 pub struct Fonts {
     pub title: IDWriteTextFormat,
     pub title_center: IDWriteTextFormat,
+    pub title_right: IDWriteTextFormat,
     pub tiny_center: IDWriteTextFormat,
     pub small_center: IDWriteTextFormat,
     pub lyric_center: IDWriteTextFormat,
@@ -322,6 +323,7 @@ fn create_fonts() -> Result<Fonts> {
         Ok(Fonts {
             title: make(15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             title_center: make(15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+            title_right: make(15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             tiny_center: make(11.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             small_center: make(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             lyric_center: make(13.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,

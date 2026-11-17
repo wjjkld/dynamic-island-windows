@@ -43,8 +43,21 @@ pub struct MediaInfo {
     pub art: Option<Arc<Vec<u8>>>,
     /// 从封面取的强调色（RGB 0..1）。
     pub accent: [f32; 3],
+    /// 播放器名（Spotify、网易云音乐…）。
+    pub app: String,
+    /// 另一个正在播放的播放器：显示成岛右边的小圆泡，点一下互换。
+    pub other: Option<Other>,
     /// 每次有变化 +1，UI 线程据此判断要不要重新拷贝。
     pub version: u64,
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub struct Other {
+    pub app: String,
+    pub title: String,
+    pub art: Option<Arc<Vec<u8>>>,
+    /// 换了歌（封面）+1。
+    pub art_id: u64,
 }
 
 impl MediaInfo {
@@ -66,8 +79,12 @@ pub enum Cmd {
     Seek(f64),
     /// 打开/关闭歌词查询。
     Lyrics(bool),
+    /// 和另一个正在播放的播放器互换主位。
+    Swap,
     /// 内部用：系统事件通知需要刷新。
     Refresh,
+    /// 内部用：系统的「当前会话」换了。
+    CurrentChanged,
 }
 
 pub struct Media {
@@ -157,11 +174,59 @@ fn request_lyrics(c: &Ctx, g: &MediaInfo) {
 
 /// 生成一个只负责"通知媒体线程去刷新"的 WinRT 事件回调。
 fn notifier<S: RuntimeType + 'static, A: RuntimeType + 'static>(tx: &Sender<Cmd>) -> TypedEventHandler<S, A> {
+    notify_with(tx, || Cmd::Refresh)
+}
+
+fn notify_with<S: RuntimeType + 'static, A: RuntimeType + 'static>(
+    tx: &Sender<Cmd>,
+    cmd: fn() -> Cmd,
+) -> TypedEventHandler<S, A> {
     let tx = tx.clone();
     TypedEventHandler::new(move |_, _| {
-        let _ = tx.send(Cmd::Refresh);
+        let _ = tx.send(cmd());
         Ok(())
     })
+}
+
+fn is_playing(s: &Session) -> bool {
+    s.GetPlaybackInfo().and_then(|p| p.PlaybackStatus()).is_ok_and(|st| st == Status::Playing)
+}
+
+fn app_id(s: &Session) -> String {
+    s.SourceAppUserModelId().map(|h| h.to_string_lossy()).unwrap_or_default()
+}
+
+/// AppUserModelId → 给人看的播放器名。
+pub fn app_name(id: &str) -> String {
+    let l = id.to_lowercase();
+    const KNOWN: [(&str, &str); 18] = [
+        ("spotify", "Spotify"),
+        ("cloudmusic", "网易云音乐"),
+        ("qqmusic", "QQ音乐"),
+        ("kugou", "酷狗音乐"),
+        ("kwmusic", "酷我音乐"),
+        ("applemusic", "Apple Music"),
+        ("zunemusic", "媒体播放器"),
+        ("zunevideo", "电影和电视"),
+        ("msedge", "Edge"),
+        ("chrome", "Chrome"),
+        ("firefox", "Firefox"),
+        ("308046b0af4a39cb", "Firefox"),
+        ("bilibili", "哔哩哔哩"),
+        ("potplayer", "PotPlayer"),
+        ("vlc", "VLC"),
+        ("foobar2000", "foobar2000"),
+        ("musicbee", "MusicBee"),
+        ("aimp", "AIMP"),
+    ];
+    if let Some((_, name)) = KNOWN.iter().find(|(k, _)| l.contains(k)) {
+        return name.to_string();
+    }
+    // 其它：取最后一段，去掉 .exe 和商店包名后缀
+    let last = id.rsplit(['\\', '/', '!']).next().unwrap_or(id);
+    let last = last.strip_suffix(".exe").or_else(|| last.strip_suffix(".EXE")).unwrap_or(last);
+    let last = last.split('_').next().unwrap_or(last);
+    last.rsplit('.').next().unwrap_or(last).to_string()
 }
 
 /// 当前会话上挂的事件，换会话时整体替换（Drop 时自动解绑）。
@@ -193,25 +258,47 @@ fn run(mut c: Ctx) -> Result<()> {
     let wic: IWICImagingFactory = unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
     let mut last_key = String::new();
 
-    // 事件驱动：会话切换、曲目/播放状态变化时系统通知我们；
+    // 事件驱动：会话增减、当前会话切换、曲目/播放状态变化时系统通知我们；
     // 另留一个低频兜底轮询，用来校正进度（拖动进度条不一定触发事件）。
-    let session_token = mgr.CurrentSessionChanged(&notifier(tx))?;
-    let mut sub: Option<Subscription> = None;
-    let mut resubscribe = true;
+    let current_token = mgr.CurrentSessionChanged(&notify_with(tx, || Cmd::CurrentChanged))?;
+    let sessions_token = mgr.SessionsChanged(&notifier(tx))?;
+    // 每个会话都挂上事件，别的播放器开始 / 停止播放时也能知道
+    let mut subs: Vec<Subscription> = Vec::new();
+    // 用户点小圆泡选中的会话；没有就跟随系统的当前会话
+    let mut selected: Option<Session> = None;
+    let mut primary: Option<Session> = None;
+    let mut other: Option<Session> = None;
+    let mut other_key = String::new();
 
     loop {
         let playing = info.lock().map(|g| g.playing).unwrap_or(false);
         let fallback = Duration::from_secs(if playing { 3 } else { 10 });
+        let mut current_changed = false;
         match rx.recv_timeout(fallback) {
-            Ok(Cmd::Refresh) => {
+            Ok(first @ (Cmd::Refresh | Cmd::CurrentChanged)) => {
                 #[cfg(debug_assertions)]
                 if std::env::var_os("ISLAND_TRACE").is_some() {
                     eprintln!("[media] refresh {:?}", std::time::SystemTime::now());
                 }
-                // 一次变化常常连发好几个事件，攒一下再查
+                // 一次变化常常连发好几个事件，攒一下再查；夹在中间的用户操作放回队列
                 std::thread::sleep(Duration::from_millis(60));
-                while rx.try_recv().is_ok() {}
-                resubscribe = true;
+                current_changed = matches!(first, Cmd::CurrentChanged);
+                let mut later = Vec::new();
+                while let Ok(m) = rx.try_recv() {
+                    match m {
+                        Cmd::Refresh => {}
+                        Cmd::CurrentChanged => current_changed = true,
+                        m => later.push(m),
+                    }
+                }
+                for m in later {
+                    let _ = tx.send(m);
+                }
+            }
+            Ok(Cmd::Swap) => {
+                if other.is_some() {
+                    selected = other.take();
+                }
             }
             Ok(Cmd::Lyrics(on)) => {
                 c.lyrics_on = on;
@@ -226,14 +313,14 @@ fn run(mut c: Ctx) -> Result<()> {
                 continue;
             }
             Ok(cmd) => {
-                if let Ok(s) = mgr.GetCurrentSession() {
+                if let Some(s) = &primary {
                     let start = info.lock().map(|g| g.start).unwrap_or(0.0);
                     let r = match cmd {
                         Cmd::Toggle => s.TryTogglePlayPauseAsync(),
                         Cmd::Next => s.TrySkipNextAsync(),
                         Cmd::Prev => s.TrySkipPreviousAsync(),
                         Cmd::Seek(sec) => s.TryChangePlaybackPositionAsync(((start + sec.max(0.0)) * 1e7) as i64),
-                        Cmd::Refresh | Cmd::Lyrics(_) => unreachable!(),
+                        Cmd::Refresh | Cmd::CurrentChanged | Cmd::Lyrics(_) | Cmd::Swap => unreachable!(),
                     };
                     if let Ok(op) = r {
                         let _ = op.join();
@@ -244,22 +331,39 @@ fn run(mut c: Ctx) -> Result<()> {
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = mgr.RemoveCurrentSessionChanged(session_token);
+                let _ = mgr.RemoveCurrentSessionChanged(current_token);
+                let _ = mgr.RemoveSessionsChanged(sessions_token);
                 return Ok(());
             }
         }
 
+        let sessions: Vec<Session> = match mgr.GetSessions() {
+            Ok(v) => (0..v.Size().unwrap_or(0)).filter_map(|i| v.GetAt(i).ok()).collect(),
+            Err(_) => Vec::new(),
+        };
         let current = mgr.GetCurrentSession().ok();
-        if resubscribe {
-            resubscribe = false;
-            let same = matches!((&sub, &current), (Some(s), Some(c)) if s.session == *c);
-            if !same {
-                sub = current.clone().and_then(|c| Subscription::new(c, tx).ok());
-            }
+        let same = subs.len() == sessions.len() && subs.iter().zip(&sessions).all(|(a, b)| a.session == *b);
+        if !same {
+            subs = sessions.iter().filter_map(|s| Subscription::new(s.clone(), tx).ok()).collect();
         }
+        // 选中的会话没了就不再选；系统的当前会话换成了另一个正在播放的（新开始播的），
+        // 让它占主位，和苹果「最新的活动在主位」一致
+        if selected.as_ref().is_some_and(|s| !sessions.contains(s)) {
+            selected = None;
+        }
+        if current_changed
+            && let Some(cur) = &current
+            && selected.as_ref().is_some_and(|s| s != cur)
+            && is_playing(cur)
+        {
+            selected = None;
+        }
+        primary = selected.clone().or(current).or_else(|| sessions.first().cloned());
+        other = sessions.iter().find(|s| Some(*s) != primary.as_ref() && is_playing(s)).cloned();
 
-        let changed = match current {
-            Some(session) => poll(&session, &wic, &c, &mut last_key).unwrap_or(false),
+        let mut changed = update_other(other.as_ref(), &wic, info, &mut other_key);
+        changed |= match &primary {
+            Some(session) => poll(session, &wic, &c, &mut last_key).unwrap_or(false),
             None => {
                 let mut g = info.lock().unwrap();
                 if g.active {
@@ -275,6 +379,33 @@ fn run(mut c: Ctx) -> Result<()> {
             (c.wake)();
         }
     }
+}
+
+/// 更新「另一个播放器」：换了播放器或歌才重新读封面。返回是否有变化。
+fn update_other(s: Option<&Session>, wic: &IWICImagingFactory, info: &Mutex<MediaInfo>, key: &mut String) -> bool {
+    let Some(s) = s else {
+        key.clear();
+        let mut g = info.lock().unwrap();
+        if g.other.take().is_some() {
+            g.version += 1;
+            return true;
+        }
+        return false;
+    };
+    let props = s.TryGetMediaPropertiesAsync().and_then(|op| op.join()).ok();
+    let title = props.as_ref().and_then(|p| p.Title().ok()).map(|t| t.to_string_lossy()).unwrap_or_default();
+    let id = app_id(s);
+    let k = format!("{id}\u{1}{title}");
+    if k == *key {
+        return false;
+    }
+    *key = k;
+    let art = props.and_then(|p| load_art(&p, wic).ok()).map(Arc::new);
+    let mut g = info.lock().unwrap();
+    let art_id = g.other.as_ref().map_or(0, |o| o.art_id) + 1;
+    g.other = Some(Other { app: app_name(&id), title, art, art_id });
+    g.version += 1;
+    true
 }
 
 fn poll(session: &Session, wic: &IWICImagingFactory, c: &Ctx, last_key: &mut String) -> Result<bool> {
@@ -315,6 +446,7 @@ fn poll(session: &Session, wic: &IWICImagingFactory, c: &Ctx, last_key: &mut Str
         }
 
     let mut g = info.lock().unwrap();
+    g.app = app_name(&app);
     let before = (g.active, g.playing, g.title.clone(), g.artist.clone(), (g.duration as i64), g.can_seek);
     g.start = start;
     g.can_seek = can_seek;
@@ -406,6 +538,16 @@ pub fn accent_of(bgra: &[u8]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_names() {
+        assert_eq!(app_name("Spotify.exe"), "Spotify");
+        assert_eq!(app_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), "媒体播放器");
+        assert_eq!(app_name("MSEdge"), "Edge");
+        assert_eq!(app_name("cloudmusic.exe"), "网易云音乐");
+        assert_eq!(app_name(r"C:\Tools\Foo\Player.exe"), "Player");
+        assert_eq!(app_name("Contoso.Tunes_abc123!App"), "App");
+    }
 
     #[test]
     fn gray_art_uses_default_accent() {

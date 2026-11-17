@@ -10,21 +10,32 @@ use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::media::{ART, Cmd, Media, MediaInfo};
+use crate::notes::{self, Notes};
 use crate::privacy::InUse;
 use crate::render::{Color, Image, Rect, Renderer, rgba};
 use crate::shelf::{self, ICON, Shelf};
 use crate::spring::Spring;
 use crate::system::{self, Battery};
+use crate::weather::{self, Icon};
 
 /// 窗口逻辑尺寸：容纳最大展开态 + 回弹余量。
 pub const WIN_W: f32 = 460.0;
-pub const WIN_H: f32 = 320.0;
+pub const WIN_H: f32 = 340.0;
 const TOP: f32 = 8.0;
 /// 展开态底部暂存区那一行的高度。
 const SHELF_ROW: f32 = 92.0;
 /// 展开态媒体页的歌词行高度（单行 / 带翻译两行）。
 const LYRIC_ROW: f32 = 28.0;
 const LYRIC_ROW2: f32 = 46.0;
+/// 便签页每条的行高。
+const NOTE_ROW: f32 = 28.0;
+/// 展开态的宽度。
+const EXPANDED_W: f32 = 400.0;
+/// 有两个播放器时，右边小圆泡和岛之间的空隙；岛最宽多少（给小圆泡留位置）。
+const BUBBLE_GAP: f32 = 6.0;
+const SPLIT_MAX_W: f32 = 380.0;
+/// 滚轮翻页的间隔，免得触控板一划翻过好几页。
+const PAGE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// 细条形态贴着屏幕顶边。
 const SLIM_TOP: f32 = 2.0;
 const TILE_W: f32 = 68.0;
@@ -43,6 +54,7 @@ const GREEN: Color = rgba(0.29, 0.86, 0.39, 1.0);
 const BLUE: Color = rgba(0.30, 0.62, 1.0, 1.0);
 const ORANGE: Color = rgba(1.0, 0.62, 0.04, 1.0);
 const RED: Color = rgba(1.0, 0.27, 0.23, 1.0);
+const YELLOW: Color = rgba(1.0, 0.8, 0.2, 1.0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
@@ -67,6 +79,8 @@ pub enum Layout {
     /// shelf：底部多一行暂存的文件；lyric：歌词行数（0 没有，1 原文，2 原文 + 翻译）。
     ExpandedMedia { shelf: bool, lyric: u8 },
     ExpandedDash { shelf: bool },
+    /// rows：便签行数（含正在输入的那一行）。
+    ExpandedNotes { shelf: bool, rows: u8 },
 }
 
 impl Layout {
@@ -87,8 +101,10 @@ impl Layout {
             Layout::LowBattery => (300.0, 34.0, 17.0),
             Layout::Device | Layout::Privacy => (350.0, 34.0, 17.0),
             Layout::Drop => (400.0, 120.0, 40.0),
-            Layout::ExpandedMedia { shelf, .. } => (400.0, self.base_height() + row(shelf), 40.0),
-            Layout::ExpandedDash { shelf } => (400.0, self.base_height() + row(shelf), 36.0),
+            Layout::ExpandedMedia { shelf, .. } => (EXPANDED_W, self.base_height() + row(shelf), 40.0),
+            Layout::ExpandedDash { shelf } | Layout::ExpandedNotes { shelf, .. } => {
+                (EXPANDED_W, self.base_height() + row(shelf), 36.0)
+            }
         }
     }
 
@@ -104,6 +120,7 @@ impl Layout {
                     }
             }
             Layout::ExpandedDash { .. } => 150.0,
+            Layout::ExpandedNotes { rows, .. } => (62.0 + rows as f32 * NOTE_ROW + 14.0).max(150.0),
             _ => self.dims().1,
         }
     }
@@ -114,11 +131,19 @@ impl Layout {
     }
 
     fn has_shelf(self) -> bool {
-        matches!(self, Layout::ExpandedMedia { shelf: true, .. } | Layout::ExpandedDash { shelf: true })
+        matches!(
+            self,
+            Layout::ExpandedMedia { shelf: true, .. } | Layout::ExpandedDash { shelf: true } | Layout::ExpandedNotes { shelf: true, .. }
+        )
     }
 
     fn is_expanded(self) -> bool {
-        matches!(self, Layout::ExpandedMedia { .. } | Layout::ExpandedDash { .. })
+        matches!(self, Layout::ExpandedMedia { .. } | Layout::ExpandedDash { .. } | Layout::ExpandedNotes { .. })
+    }
+
+    /// 旁边可以挂另一个播放器的小圆泡的紧凑形态。
+    fn can_split(self) -> bool {
+        matches!(self, Layout::Media { .. } | Layout::TrackToast | Layout::Timer | Layout::Idle { slim: false, .. })
     }
 }
 
@@ -154,8 +179,10 @@ pub struct State {
     pub media_active: bool,
     pub media_visible: bool,
     pub files: bool,
-    /// 展开时看的是仪表盘页（有音乐时可以滚轮切过去）。
-    pub dash_page: bool,
+    /// 展开时看的是哪一页（滚轮或点页码切换）。
+    pub page: Page,
+    /// 便签页的行数。
+    pub notes: u8,
     /// 当前歌曲的歌词：0 没有，1 有，2 有并且带翻译。
     pub lyrics: u8,
     pub timer: bool,
@@ -165,16 +192,25 @@ pub struct State {
     pub privacy: bool,
 }
 
+/// 展开态的页：音乐（有播放器时才有）、仪表盘、便签。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Page {
+    #[default]
+    Media,
+    Dash,
+    Notes,
+}
+
 /// 选择当前应显示的形态。纯函数，方便测试。
 pub fn choose_layout(s: State) -> Layout {
     if s.drop_hover {
         return Layout::Drop;
     }
     if s.expanded {
-        return if s.media_active && !s.dash_page {
-            Layout::ExpandedMedia { shelf: s.files, lyric: s.lyrics }
-        } else {
-            Layout::ExpandedDash { shelf: s.files }
+        return match s.page {
+            Page::Notes => Layout::ExpandedNotes { shelf: s.files, rows: s.notes },
+            Page::Media if s.media_active => Layout::ExpandedMedia { shelf: s.files, lyric: s.lyrics },
+            _ => Layout::ExpandedDash { shelf: s.files },
         };
     }
     match s.toast {
@@ -205,6 +241,11 @@ enum Btn {
     AddMinute,
     CancelTimer,
     Page,
+    Swap,
+    NewNote,
+    CopyNote(usize),
+    DelNote(usize),
+    LocationSettings,
 }
 
 /// 暂存区里一个文件的格子。
@@ -220,6 +261,7 @@ enum PressOn {
     Tile(u64),
     Close(u64),
     Seek,
+    Bubble,
     Other,
 }
 
@@ -269,11 +311,17 @@ pub struct Island {
     leave_since: Option<Instant>,
     expanded: bool,
     pressed: bool,
-    dash_page: bool,
+    page: Page,
+    page_changed: Instant,
+    cursor: (f32, f32),
 
     pub media: Media,
     info: MediaInfo,
     art: Option<(u64, Image)>,
+    /// 另一个播放器的封面（小圆泡里画）。
+    other_art: Option<(u64, Image)>,
+    /// 0..1：小圆泡从岛里分出来的程度。
+    split: Spring,
     last_track: u64,
     last_playing: Option<Instant>,
     lyric: LyricAnim,
@@ -290,7 +338,15 @@ pub struct Island {
     pub slim: bool,
     privacy: InUse,
     privacy_msg: (String, bool),
-    device: (String, f32, bool),
+    /// 设备名、右侧说明（音量或「已连接」）、蓝牙耳机电量（有的话代替说明显示）。
+    device: (String, String, Option<u8>),
+    pub weather: weather::State,
+    pub notes: Notes,
+    /// 正在新建便签（输入框是主循环开的独立小窗口，盖在第一行上）。
+    editing: bool,
+    note_request: bool,
+    /// 刚复制的便签：(第几条, 时刻)，显示「已复制」。
+    copied: Option<(usize, Instant)>,
 
     pub shelf: Shelf,
     icons: HashMap<u64, Image>,
@@ -321,7 +377,7 @@ pub enum Pace {
 }
 
 impl Island {
-    pub fn new(media: Media, shelf: Shelf) -> Self {
+    pub fn new(media: Media, shelf: Shelf, notes: Notes) -> Self {
         let start = Layout::Idle { files: !shelf.items.is_empty(), slim: false };
         let (w, h, r) = start.dims();
         let now = Instant::now();
@@ -338,10 +394,14 @@ impl Island {
             leave_since: None,
             expanded: false,
             pressed: false,
-            dash_page: false,
+            page: Page::Media,
+            page_changed: now,
+            cursor: (-1.0, -1.0),
             media,
             info: MediaInfo::default(),
             art: None,
+            other_art: None,
+            split: Spring::new(0.0, 0.32, 0.85),
             last_track: 0,
             last_playing: None,
             lyric: LyricAnim { idx: None, track: 0, prev: String::new(), prev_trans: String::new(), changed: now },
@@ -355,7 +415,12 @@ impl Island {
             slim: false,
             privacy: InUse::default(),
             privacy_msg: (String::new(), false),
-            device: (String::new(), 0.0, false),
+            device: (String::new(), String::new(), None),
+            weather: weather::State::Unknown,
+            notes,
+            editing: false,
+            note_request: false,
+            copied: None,
             shelf,
             icons: HashMap::new(),
             tiles: Vec::new(),
@@ -376,12 +441,48 @@ impl Island {
     /// 岛当前（动画中）的外框。
     pub fn rect(&self) -> Rect {
         let (w, h) = (self.w.value, self.h.value);
-        Rect::new((WIN_W - w) / 2.0, self.top.value, w, h)
+        // 有小圆泡时整组居中，岛往左让出一半位置
+        let shift = self.split.value.clamp(0.0, 1.0) * (BUBBLE_GAP + h) / 2.0;
+        Rect::new((WIN_W - w) / 2.0 - shift, self.top.value, w, h)
+    }
+
+    /// 另一个播放器的小圆泡：从岛的右端分出来，往右滑到旁边。
+    fn bubble_rect(&self) -> Option<Rect> {
+        let s = self.split.value;
+        if s < 0.02 {
+            return None;
+        }
+        let m = self.rect();
+        let d = m.h;
+        let cx = m.x + m.w - d / 2.0 + s * (BUBBLE_GAP + d);
+        let k = d * (0.5 + 0.5 * s.min(1.0));
+        Some(Rect::new(cx - k / 2.0, m.y + (d - k) / 2.0, k, k))
+    }
+
+    fn on_bubble(&self, x: f32, y: f32) -> bool {
+        self.split.target > 0.5 && self.bubble_rect().is_some_and(|b| b.inflate(3.0).contains(x, y))
     }
 
     /// 鼠标是否在岛上（用于决定是否穿透点击）。
     pub fn hit(&self, x: f32, y: f32) -> bool {
-        self.rect().inflate(3.0).contains(x, y)
+        self.rect().inflate(3.0).contains(x, y) || self.on_bubble(x, y)
+    }
+
+    /// 某个形态的目标尺寸：旁边挂着小圆泡时岛不能太宽。
+    fn dims_of(&self, l: Layout) -> (f32, f32, f32) {
+        let (w, h, r) = l.dims();
+        if self.split.target > 0.5 { (w.min(SPLIT_MAX_W), h, r) } else { (w, h, r) }
+    }
+
+    /// 有几页、当前是第几页。
+    fn pages(&self) -> Vec<Page> {
+        if self.info.active { vec![Page::Media, Page::Dash, Page::Notes] } else { vec![Page::Dash, Page::Notes] }
+    }
+
+    fn page_index(&self) -> usize {
+        let pages = self.pages();
+        let cur = if self.page == Page::Media && !self.info.active { Page::Dash } else { self.page };
+        pages.iter().position(|p| *p == cur).unwrap_or(0)
     }
 
     pub fn is_scrubbing(&self) -> bool {
@@ -413,6 +514,16 @@ impl Island {
     // ---------- 鼠标 ----------
 
     pub fn on_mouse(&mut self, inside: bool, cursor: (f32, f32), now: Instant) {
+        if self.expanded && cursor != self.cursor && matches!(self.shown, Layout::ExpandedNotes { .. }) {
+            self.dirty = true;
+        }
+        self.cursor = cursor;
+        // 指着小圆泡时不展开（要能点它），也不收起
+        if !self.expanded && inside && self.on_bubble(cursor.0, cursor.1) {
+            self.hover_since = None;
+            self.leave_since = None;
+            return;
+        }
         let hovered = if inside { self.tile_at(cursor.0, cursor.1).map(|t| t.0) } else { None };
         if hovered != self.hovered_tile {
             self.hovered_tile = hovered;
@@ -435,11 +546,11 @@ impl Island {
                 self.pressed = false;
                 self.press.target = 1.0;
             }
-            if self.expanded && !self.pin {
+            if self.expanded && !self.pin && !self.editing {
                 let since = *self.leave_since.get_or_insert(now);
                 if now - since >= LEAVE_DELAY {
                     self.expanded = false;
-                    self.dash_page = false;
+                    self.page = Page::Media;
                     self.leave_since = None;
                 }
             }
@@ -475,6 +586,8 @@ impl Island {
             self.scrub = Some(self.scrub_frac(x));
             self.dirty = true;
             PressOn::Seek
+        } else if !self.expanded && self.on_bubble(x, y) {
+            PressOn::Bubble
         } else {
             match self.tile_at(x, y) {
                 Some((id, true)) => PressOn::Close(id),
@@ -506,13 +619,18 @@ impl Island {
         }
     }
 
+    /// 滚轮翻页：往下滚到下一页，往上滚到上一页。
     pub fn wheel(&mut self, delta: i32) {
-        if self.expanded && self.info.active {
-            let want_dash = delta < 0;
-            if want_dash != self.dash_page {
-                self.dash_page = want_dash;
-                self.dirty = true;
-            }
+        if !self.expanded || self.editing || self.page_changed.elapsed() < PAGE_DEBOUNCE {
+            return;
+        }
+        let pages = self.pages();
+        let i = self.page_index();
+        let j = if delta < 0 { (i + 1).min(pages.len() - 1) } else { i.saturating_sub(1) };
+        if j != i {
+            self.page = pages[j];
+            self.page_changed = Instant::now();
+            self.dirty = true;
         }
     }
 
@@ -542,6 +660,10 @@ impl Island {
     }
 
     pub fn mouse_up(&mut self, x: f32, y: f32) {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ISLAND_TRACE").is_some() {
+            eprintln!("[click] up at ({x:.0}, {y:.0}) expanded={} buttons={:?}", self.expanded, self.buttons.iter().map(|b| b.0).collect::<Vec<_>>());
+        }
         self.pressed = false;
         self.press.target = 1.0;
         let press = self.press_on.take();
@@ -552,6 +674,12 @@ impl Island {
             self.info.position = target;
             self.info.sampled_at = Some(Instant::now());
             self.dirty = true;
+            return;
+        }
+        if let Some((PressOn::Bubble, ..)) = press {
+            if self.on_bubble(x, y) {
+                self.media.send(Cmd::Swap);
+            }
             return;
         }
         if !self.expanded {
@@ -590,7 +718,30 @@ impl Island {
                 }
             }
             Btn::CancelTimer => self.timer = None,
-            Btn::Page => self.dash_page = !self.dash_page,
+            Btn::Page => {
+                let pages = self.pages();
+                self.page = pages[(self.page_index() + 1) % pages.len()];
+                self.page_changed = Instant::now();
+            }
+            Btn::Swap => self.media.send(Cmd::Swap),
+            Btn::NewNote => {
+                if !self.notes.is_full() && !self.editing {
+                    self.editing = true;
+                    self.note_request = true;
+                }
+            }
+            Btn::CopyNote(i) => {
+                if let Some(t) = self.notes.items.get(i)
+                    && notes::copy(t)
+                {
+                    self.copied = Some((i, Instant::now()));
+                }
+            }
+            Btn::DelNote(i) => {
+                self.notes.remove(i);
+                self.copied = None;
+            }
+            Btn::LocationSettings => open_url("ms-settings:privacy-location"),
         }
         self.dirty = true;
     }
@@ -666,12 +817,35 @@ impl Island {
                 self.set_privacy(InUse { mic: vec!["WeChat".into()], cam: vec!["Zoom".into()] });
                 self.toast = None;
             }
-            "device" => self.show_device("耳机 (WH-1000XM5)".into(), 0.36, false),
+            "device" => self.show_device("耳机 (WH-1000XM5)".into(), "36%".into(), None),
+            "connected" => self.show_device("耳机 (EDIFIER W830NB)".into(), "已连接".into(), Some(80)),
             "lowbatt" => {
                 self.battery = Some(Battery { percent: 19, charging: false });
                 self.show_toast(Toast::LowBattery);
             }
             "slim" => self.slim = true,
+            "notes" => {
+                self.notes.items = vec!["周五前把报销单交了".into(), "灵动岛：试试把天气放到细条上".into(), "买咖啡豆".into()];
+                self.page = Page::Notes;
+                self.expanded = true;
+                self.pin = true;
+                self.cursor = (230.0, 8.0 + 50.0 + NOTE_ROW * 1.5);
+            }
+            "weather" => {
+                self.weather = weather::State::Ready(weather::Now { temp: 17.4, hi: 20.0, lo: 11.0, desc: "多云", icon: Icon::PartlyCloudy, is_day: true });
+                self.page = Page::Dash;
+                self.expanded = true;
+                self.pin = true;
+            }
+            "split" | "split_x" => {
+                self.debug_preset("media");
+                self.info.other = Some(crate::media::Other { app: "Chrome".into(), title: "视频".into(), art: None, art_id: 1 });
+                self.info.app = "网易云音乐".into();
+                if name == "split_x" {
+                    self.expanded = true;
+                    self.pin = true;
+                }
+            }
             "dash0" => {
                 self.expanded = true;
                 self.pin = true;
@@ -681,10 +855,30 @@ impl Island {
         self.dirty = true;
     }
 
-    /// 输出设备换了：显示设备名和它的音量。
-    pub fn show_device(&mut self, name: String, volume: f32, muted: bool) {
-        self.device = (name, volume, muted);
+    /// 输出设备换了或连上了：显示设备名和右侧说明；蓝牙耳机显示电量。
+    pub fn show_device(&mut self, name: String, note: String, battery: Option<u8>) {
+        self.device = (name, note, battery);
         self.show_toast(Toast::Device);
+    }
+
+    /// 点了「+」要新建便签时返回输入框的位置（窗口内逻辑坐标），只返回一次。
+    pub fn take_note_request(&mut self) -> Option<Rect> {
+        if !std::mem::take(&mut self.note_request) {
+            return None;
+        }
+        // 展开态总是宽 EXPANDED_W、贴着 TOP；输入框占第一行
+        let r = Rect::new((WIN_W - EXPANDED_W) / 2.0, TOP, EXPANDED_W, 0.0);
+        Some(note_row(r, 0).inflate(-2.0))
+    }
+
+    /// 输入结束：text 为 None 表示取消。
+    pub fn end_note(&mut self, text: Option<String>) {
+        self.editing = false;
+        if let Some(t) = text {
+            self.notes.add(&t);
+        }
+        self.copied = None;
+        self.dirty = true;
     }
 
     /// 麦克风 / 摄像头占用情况变了；有新应用开始用时弹一下。
@@ -749,7 +943,8 @@ impl Island {
             media_active: self.info.active,
             media_visible,
             files: !self.shelf.items.is_empty(),
-            dash_page: self.dash_page,
+            page: self.page,
+            notes: (self.notes.items.len() + self.editing as usize) as u8,
             lyrics: match &self.info.lyrics {
                 None => 0,
                 Some(l) if l.lines.iter().any(|x| x.trans.is_some()) => 2,
@@ -759,9 +954,13 @@ impl Island {
             slim: self.slim,
             privacy: self.privacy.any(),
         });
-        if target != self.target {
+        let split = self.info.other.is_some() && target.can_split();
+        let split_t = if split { 1.0 } else { 0.0 };
+        let split_changed = self.split.target != split_t;
+        self.split.target = split_t;
+        if target != self.target || split_changed {
             self.target = target;
-            let (w, h, r) = target.dims();
+            let (w, h, r) = self.dims_of(target);
             self.w.target = w;
             self.h.target = h;
             self.r.target = r;
@@ -785,7 +984,11 @@ impl Island {
             self.content_alpha = (self.content_alpha + dt / 0.22).min(1.0);
         }
 
-        for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press, &mut self.top] {
+        if self.copied.is_some_and(|(_, t)| now - t > Duration::from_millis(1400)) {
+            self.copied = None;
+            self.dirty = true;
+        }
+        for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press, &mut self.top, &mut self.split] {
             s.step(dt);
         }
         if let Some(l) = &mut self.level {
@@ -828,7 +1031,7 @@ impl Island {
 
     fn animating(&self) -> bool {
         let level_moving = self.shown == Layout::Level && self.level.as_ref().is_some_and(|l| !l.fill.settled());
-        !(self.w.settled() && self.h.settled() && self.r.settled() && self.press.settled() && self.top.settled())
+        !(self.w.settled() && self.h.settled() && self.r.settled() && self.press.settled() && self.top.settled() && self.split.settled())
             || self.shown != self.target
             || self.content_alpha < 1.0
             || level_moving
@@ -844,6 +1047,7 @@ impl Island {
         let timer = self.timer.is_some();
         let periodic = match self.shown {
             Layout::Media { .. } | Layout::TrackToast | Layout::ExpandedMedia { .. } if playing => Some(33),
+            Layout::ExpandedNotes { .. } if self.copied.is_some() => Some(250),
             Layout::Media { .. } | Layout::Timer if timer => Some(250),
             Layout::ExpandedDash { .. } if timer => Some(250),
             Layout::ExpandedDash { .. } => Some(1000),
@@ -869,6 +1073,13 @@ impl Island {
         } else {
             self.art = None;
         }
+        match self.info.other.as_ref().and_then(|o| o.art.as_ref().map(|px| (o.art_id, px))) {
+            Some((id, px)) if self.other_art.as_ref().map(|a| a.0) != Some(id) => {
+                self.other_art = g.image(px, ART).ok().map(|i| (id, i));
+            }
+            Some(_) => {}
+            None => self.other_art = None,
+        }
         // 暂存文件的图标：新的建、删掉的丢
         self.icons.retain(|id, _| self.shelf.items.iter().any(|i| i.id == *id));
         for item in &self.shelf.items {
@@ -886,11 +1097,14 @@ impl Island {
         g.set_transform(Matrix3x2::scale_around(s, s, center));
 
         let radius = self.r.value.min(r.h / 2.0).max(0.0);
+        if let Some(b) = self.bubble_rect() {
+            self.draw_bubble(g, b);
+        }
         g.fill_rrect(r, radius, BLACK);
         g.stroke_rrect(r.inflate(-0.5), radius, 1.0, rgba(1.0, 1.0, 1.0, 0.07));
 
         // 尺寸还差得远时不画内容，避免内容溢出到形变中的岛外
-        let (tw, th, _) = self.shown.dims();
+        let (tw, th, _) = self.dims_of(self.shown);
         let gap = (r.w - tw).abs() + (r.h - th).abs();
         let a = self.content_alpha * (1.0 - gap / 90.0).clamp(0.0, 1.0);
         self.buttons.clear();
@@ -921,8 +1135,9 @@ impl Island {
                 Layout::Drop => self.draw_drop(g, r, a),
                 Layout::ExpandedMedia { lyric, .. } => self.draw_expanded_media(g, r, a, lyric),
                 Layout::ExpandedDash { .. } => self.draw_dash(g, r, a),
+                Layout::ExpandedNotes { .. } => self.draw_notes(g, r, a),
             }
-            if self.shown.is_expanded() && self.info.active {
+            if self.shown.is_expanded() {
                 self.draw_page_dots(g, r, a);
             }
             if self.shown.has_shelf() {
@@ -998,10 +1213,11 @@ impl Island {
     fn draw_page_dots(&mut self, g: &Renderer, r: Rect, a: f32) {
         let cx = r.x + r.w / 2.0;
         let y = r.y + 9.0;
-        for (i, dash) in [false, true].into_iter().enumerate() {
-            let on = self.dash_page == dash;
-            let x = cx - 7.0 + i as f32 * 10.0;
-            g.fill_rrect(Rect::new(x, y, 5.0, 5.0), 2.5, with_alpha(WHITE, if on { 0.85 } else { 0.25 } * a));
+        let (n, cur) = (self.pages().len(), self.page_index());
+        let x0 = cx - (n as f32 * 10.0 - 5.0) / 2.0;
+        for i in 0..n {
+            let x = x0 + i as f32 * 10.0;
+            g.fill_rrect(Rect::new(x, y, 5.0, 5.0), 2.5, with_alpha(WHITE, if i == cur { 0.85 } else { 0.25 } * a));
         }
         self.buttons.push((Btn::Page, Rect::new(cx - 24.0, r.y, 48.0, 20.0)));
     }
@@ -1206,7 +1422,7 @@ impl Island {
         }
     }
 
-    /// 耳机图标 + 设备名 + 音量。
+    /// 耳机图标 + 设备名 + 音量 / 电量。
     fn draw_device(&self, g: &Renderer, r: Rect, a: f32) {
         let cy = r.y + r.h / 2.0;
         let (hx, c) = (r.x + 24.0, with_alpha(WHITE, a));
@@ -1216,10 +1432,18 @@ impl Island {
         g.pop_clip();
         g.fill_rrect(Rect::new(hx - 8.5, cy, 4.0, 7.0), 1.5, c);
         g.fill_rrect(Rect::new(hx + 4.5, cy, 4.0, 7.0), 1.5, c);
-        let (name, volume, muted) = &self.device;
-        g.text(name, &g.fonts.small, Rect::new(hx + 16.0, r.y, r.w - 24.0 - 16.0 - 70.0, r.h), c);
-        let pct = if *muted { "静音".to_string() } else { format!("{}%", (volume * 100.0).round() as i32) };
-        g.text(&pct, &g.fonts.small_right, Rect::new(r.x + r.w - 18.0 - 50.0, r.y, 50.0, r.h), with_alpha(WHITE, 0.6 * a));
+        let (name, note, battery) = &self.device;
+        g.text(name, &g.fonts.small, Rect::new(hx + 16.0, r.y, r.w - 24.0 - 16.0 - 100.0, r.h), c);
+        match battery {
+            Some(p) => {
+                let bx = r.x + r.w - 16.0 - 26.0;
+                let b = Battery { percent: *p, charging: false };
+                self.draw_battery(g, bx, cy, b, a);
+                let pc = if *p <= 20 { RED } else { GREEN };
+                g.text(&format!("{p}%"), &g.fonts.small_right, Rect::new(bx - 56.0, r.y, 50.0, r.h), with_alpha(pc, a));
+            }
+            None => g.text(note, &g.fonts.small_right, Rect::new(r.x + r.w - 18.0 - 60.0, r.y, 60.0, r.h), with_alpha(WHITE, 0.6 * a)),
+        }
     }
 
     fn draw_privacy_toast(&self, g: &Renderer, r: Rect, a: f32) {
@@ -1249,6 +1473,19 @@ impl Island {
         g.text(&self.info.title, &g.fonts.title, Rect::new(tx, art.y + 8.0, tw, 22.0), with_alpha(WHITE, a));
         g.text(&self.info.artist, &g.fonts.body, Rect::new(tx, art.y + 32.0, tw, 20.0), with_alpha(WHITE, 0.55 * a));
         self.draw_bars(g, r.x + r.w - pad, art.y + 19.0, 16.0, a);
+        if let Some(o) = &self.info.other {
+            // 右上角：另一个播放器，点一下互换
+            let chip = Rect::new(r.x + r.w - 34.0 - 104.0, r.y + 6.0, 104.0, 18.0);
+            g.fill_rrect(chip, 9.0, with_alpha(WHITE, 0.12 * a));
+            let dot = Rect::new(chip.x + 4.0, chip.y + 3.0, 12.0, 12.0);
+            match &self.other_art {
+                Some((_, img)) => g.draw_image(img, dot, 6.0, a),
+                None => g.fill_rrect(dot, 6.0, with_alpha(self.accent(), a)),
+            }
+            let label = format!("切到 {}", o.app);
+            g.text(&label, &g.fonts.small, Rect::new(chip.x + 21.0, chip.y, chip.w - 27.0, chip.h), with_alpha(WHITE, 0.8 * a));
+            self.buttons.push((Btn::Swap, chip.inflate(3.0)));
+        }
 
         let mut row_y = art.y + art.h + 14.0;
         if lyric > 0 {
@@ -1309,12 +1546,32 @@ impl Island {
         let pad = 24.0;
         g.text(&clock.time, &g.fonts.clock, Rect::new(r.x + pad, r.y + 14.0, 160.0, 46.0), with_alpha(WHITE, a));
         g.text(&clock.date, &g.fonts.body, Rect::new(r.x + pad + 2.0, r.y + 58.0, 200.0, 22.0), with_alpha(WHITE, 0.55 * a));
+        let right = r.x + r.w - pad;
+        match &self.weather {
+            weather::State::Ready(n) => {
+                let (desc, icon) = (n.desc, n.icon);
+                let temp = format!("{}°", n.temp.round() as i32);
+                g.text(&temp, &g.fonts.title_right, Rect::new(right - 60.0, r.y + 18.0, 60.0, 24.0), with_alpha(WHITE, a));
+                draw_weather_icon(g, right - 52.0, r.y + 30.0, icon, n.is_day, a);
+                let line = format!("{desc}  {}° / {}°", n.lo.round() as i32, n.hi.round() as i32);
+                g.text(&line, &g.fonts.small_right, Rect::new(right - 180.0, r.y + 42.0, 180.0, 18.0), with_alpha(WHITE, 0.55 * a));
+            }
+            weather::State::NoLocation => {
+                let hint = Rect::new(right - 150.0, r.y + 22.0, 150.0, 18.0);
+                g.text("开启定位以显示天气 ›", &g.fonts.small_right, hint, with_alpha(WHITE, 0.4 * a));
+                self.buttons.push((Btn::LocationSettings, hint.inflate(4.0)));
+            }
+            weather::State::Unknown => {}
+        }
         if let Some(b) = self.battery {
-            let bx = r.x + r.w - pad - 26.0;
-            let cy = r.y + 36.0;
+            let bx = right - 26.0;
+            let cy = r.y + 69.0;
             self.draw_battery(g, bx, cy, b, a);
             let c = if b.charging { GREEN } else { WHITE };
-            g.text(&format!("{}%", b.percent), &g.fonts.small_right, Rect::new(bx - 64.0, cy - 9.0, 58.0, 18.0), with_alpha(c, a));
+            g.text(&format!("{}%", b.percent), &g.fonts.small_right, Rect::new(bx - 52.0, cy - 9.0, 46.0, 18.0), with_alpha(c, a));
+            if let Some(left) = system::battery_time() {
+                g.text(&system::fmt_left(left), &g.fonts.small_right, Rect::new(bx - 52.0 - 130.0, cy - 9.0, 126.0, 18.0), with_alpha(WHITE, 0.45 * a));
+            }
         }
 
         // 计时器一行
@@ -1335,6 +1592,150 @@ impl Island {
                 self.pill(g, pr, label, ORANGE, Btn::StartTimer(secs), a);
             }
         }
+    }
+}
+
+impl Island {
+    /// 另一个播放器的小圆泡：封面，没有封面时画个音符。
+    fn draw_bubble(&self, g: &Renderer, b: Rect) {
+        let s = self.split.value.clamp(0.0, 1.0);
+        g.fill_rrect(b, b.h / 2.0, BLACK);
+        g.stroke_rrect(b.inflate(-0.5), b.h / 2.0, 1.0, rgba(1.0, 1.0, 1.0, 0.07));
+        let inner = b.inflate(-5.0);
+        let a = ((s - 0.4) / 0.6).clamp(0.0, 1.0);
+        match &self.other_art {
+            Some((_, img)) => g.draw_image(img, inner, inner.h / 2.0, a),
+            None => {
+                let (cx, cy, k) = (inner.x + inner.w / 2.0, inner.y + inner.h / 2.0, inner.w / 24.0);
+                let c = with_alpha(WHITE, 0.75 * a);
+                g.fill_rrect(Rect::new(cx + 1.5 * k, cy - 7.0 * k, 2.0 * k, 11.0 * k), k, c);
+                g.fill_rrect(Rect::new(cx - 4.0 * k, cy + 1.0 * k, 7.5 * k, 6.0 * k), 3.0 * k, c);
+            }
+        }
+    }
+
+    /// 便签页：标题和「+」，下面每行一条；悬停显示删除，点一下复制。
+    fn draw_notes(&mut self, g: &Renderer, r: Rect, a: f32) {
+        let pad = 24.0;
+        g.text("便签", &g.fonts.title, Rect::new(r.x + pad, r.y + 16.0, 120.0, 24.0), with_alpha(WHITE, a));
+        let add = Rect::new(r.x + r.w - pad - 26.0, r.y + 15.0, 26.0, 26.0);
+        if self.notes.is_full() {
+            g.text(&format!("最多 {} 条", notes::MAX), &g.fonts.small_right, Rect::new(add.x + add.w - 120.0, add.y, 120.0, add.h), with_alpha(WHITE, 0.4 * a));
+        } else if !self.editing {
+            let hot = add.inflate(4.0).contains(self.cursor.0, self.cursor.1);
+            g.fill_rrect(add, 13.0, with_alpha(WHITE, if hot { 0.22 } else { 0.12 } * a));
+            let (cx, cy) = (add.x + 13.0, add.y + 13.0);
+            g.line((cx - 5.5, cy), (cx + 5.5, cy), 1.8, with_alpha(WHITE, a));
+            g.line((cx, cy - 5.5), (cx, cy + 5.5), 1.8, with_alpha(WHITE, a));
+            self.buttons.push((Btn::NewNote, add.inflate(5.0)));
+        }
+
+        let first = if self.editing {
+            // 输入框（独立小窗口）就盖在这一行上，这里画个底
+            g.fill_rrect(note_row(r, 0).inflate(-2.0), 8.0, with_alpha(rgba(0.17, 0.17, 0.18, 1.0), a));
+            1
+        } else {
+            0
+        };
+        if self.notes.items.is_empty() && !self.editing {
+            g.text("点右上角的 + 记下一个想法", &g.fonts.small_center, Rect::new(r.x, r.y + 80.0, r.w, 22.0), with_alpha(WHITE, 0.35 * a));
+            return;
+        }
+        let items = self.notes.items.clone();
+        for (i, text) in items.iter().enumerate() {
+            let row = note_row(r, first + i);
+            let hover = !self.editing && row.contains(self.cursor.0, self.cursor.1);
+            if hover {
+                g.fill_rrect(row, 8.0, with_alpha(WHITE, 0.07 * a));
+            }
+            let cy = row.y + row.h / 2.0;
+            g.fill_rrect(Rect::new(row.x + 9.0, cy - 3.0, 6.0, 6.0), 3.0, with_alpha(YELLOW, a));
+            g.text(text, &g.fonts.body, Rect::new(row.x + 24.0, row.y, row.w - 24.0 - 70.0, row.h), with_alpha(WHITE, 0.9 * a));
+            if self.copied.is_some_and(|(j, _)| j == i) {
+                g.text("已复制", &g.fonts.small_right, Rect::new(row.x + row.w - 70.0, row.y, 62.0, row.h), with_alpha(GREEN, a));
+            } else if hover {
+                g.text("复制", &g.fonts.small_right, Rect::new(row.x + row.w - 84.0, row.y, 50.0, row.h), with_alpha(WHITE, 0.4 * a));
+                let close = Rect::new(row.x + row.w - 26.0, cy - 9.0, 18.0, 18.0);
+                let (cx, ccy) = (close.x + 9.0, close.y + 9.0);
+                g.fill_rrect(close, 9.0, with_alpha(rgba(0.35, 0.35, 0.38, 1.0), a));
+                let c = with_alpha(WHITE, a);
+                g.line((cx - 3.5, ccy - 3.5), (cx + 3.5, ccy + 3.5), 1.6, c);
+                g.line((cx - 3.5, ccy + 3.5), (cx + 3.5, ccy - 3.5), 1.6, c);
+                self.buttons.push((Btn::DelNote(i), close.inflate(4.0)));
+            }
+            if !self.editing {
+                self.buttons.push((Btn::CopyNote(i), row));
+            }
+        }
+    }
+}
+
+/// 便签页第 i 行的位置。
+fn note_row(r: Rect, i: usize) -> Rect {
+    Rect::new(r.x + 16.0, r.y + 50.0 + i as f32 * NOTE_ROW, r.w - 32.0, NOTE_ROW - 2.0)
+}
+
+/// 简笔天气图标，(cx, cy) 是中心，大约 22×18。
+fn draw_weather_icon(g: &Renderer, cx: f32, cy: f32, icon: Icon, day: bool, a: f32) {
+    let sun = with_alpha(YELLOW, a);
+    let cloud_c = with_alpha(rgba(0.85, 0.87, 0.9, 1.0), a);
+    let small_sun = |x: f32, y: f32, k: f32| {
+        if day {
+            g.fill_rrect(Rect::new(x - 3.5 * k, y - 3.5 * k, 7.0 * k, 7.0 * k), 3.5 * k, sun);
+            for i in 0..8 {
+                let (s, c) = (i as f32 * std::f32::consts::FRAC_PI_4).sin_cos();
+                g.line((x + c * 5.5 * k, y + s * 5.5 * k), (x + c * 7.5 * k, y + s * 7.5 * k), 1.4, sun);
+            }
+        } else {
+            // 月牙：亮圆上叠一个黑圆
+            let moon = with_alpha(rgba(0.95, 0.92, 0.75, 1.0), a);
+            g.fill_rrect(Rect::new(x - 6.0 * k, y - 6.0 * k, 12.0 * k, 12.0 * k), 6.0 * k, moon);
+            g.fill_rrect(Rect::new(x - 2.5 * k, y - 8.0 * k, 12.0 * k, 12.0 * k), 6.0 * k, BLACK);
+        }
+    };
+    let cloud = |x: f32, y: f32| {
+        g.fill_rrect(Rect::new(x - 10.0, y - 1.0, 20.0, 8.0), 4.0, cloud_c);
+        g.fill_rrect(Rect::new(x - 7.0, y - 5.0, 9.0, 9.0), 4.5, cloud_c);
+        g.fill_rrect(Rect::new(x - 2.0, y - 8.0, 11.0, 11.0), 5.5, cloud_c);
+    };
+    match icon {
+        Icon::Clear => small_sun(cx, cy, 1.0),
+        Icon::PartlyCloudy => {
+            small_sun(cx - 4.0, cy - 3.0, 0.8);
+            cloud(cx + 2.0, cy + 2.0);
+        }
+        Icon::Cloudy => cloud(cx, cy),
+        Icon::Fog => {
+            for i in 0..3 {
+                let y = cy - 5.0 + i as f32 * 5.0;
+                g.line((cx - 9.0 + i as f32 * 2.0, y), (cx + 9.0 - i as f32 * 2.0, y), 2.0, cloud_c);
+            }
+        }
+        Icon::Rain | Icon::Snow | Icon::Thunder => {
+            cloud(cx, cy - 3.0);
+            let drop_c = with_alpha(if icon == Icon::Snow { WHITE } else { BLUE }, a);
+            for i in 0..3 {
+                let x = cx - 6.0 + i as f32 * 6.0;
+                match icon {
+                    Icon::Snow => g.fill_rrect(Rect::new(x - 1.5, cy + 7.0, 3.0, 3.0), 1.5, drop_c),
+                    Icon::Rain => g.line((x + 1.0, cy + 6.0), (x - 1.0, cy + 10.0), 1.6, drop_c),
+                    _ => {}
+                }
+            }
+            if icon == Icon::Thunder {
+                g.fill_poly(&[(cx + 1.0, cy + 4.0), (cx - 3.0, cy + 9.0), (cx, cy + 9.0), (cx - 1.5, cy + 13.0), (cx + 4.0, cy + 7.5), (cx + 1.0, cy + 7.5), (cx + 3.0, cy + 4.0)], sun);
+            }
+        }
+    }
+}
+
+/// 用系统默认方式打开（设置页、网址）。
+fn open_url(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
     }
 }
 
@@ -1360,8 +1761,23 @@ mod tests {
 
     #[test]
     fn dash_page_when_media_playing() {
-        let s = State { dash_page: true, ..st(true, None, true, true) };
+        let s = State { page: Page::Dash, ..st(true, None, true, true) };
         assert_eq!(choose_layout(s), Layout::ExpandedDash { shelf: false });
+        // 没有音乐时音乐页落到仪表盘
+        assert_eq!(choose_layout(State { page: Page::Media, ..st(true, None, false, false) }), Layout::ExpandedDash { shelf: false });
+        let n = State { page: Page::Notes, notes: 3, files: true, ..st(true, None, true, true) };
+        assert_eq!(choose_layout(n), Layout::ExpandedNotes { shelf: true, rows: 3 });
+    }
+
+    #[test]
+    fn split_only_beside_compact_pills() {
+        assert!(Layout::Media { lyric: true }.can_split());
+        assert!(Layout::Idle { files: false, slim: false }.can_split());
+        assert!(!Layout::Idle { files: false, slim: true }.can_split());
+        assert!(!Layout::ExpandedMedia { shelf: false, lyric: 0 }.can_split());
+        // 岛缩到 SPLIT_MAX_W 后，小圆泡也放得下
+        let (_, h, _) = Layout::Media { lyric: true }.dims();
+        assert!(SPLIT_MAX_W + BUBBLE_GAP + h + 20.0 <= WIN_W);
     }
 
     #[test]
@@ -1424,6 +1840,8 @@ mod tests {
             Layout::ExpandedMedia { shelf: true, lyric: 2 },
             Layout::ExpandedDash { shelf: false },
             Layout::ExpandedDash { shelf: true },
+            Layout::ExpandedNotes { shelf: false, rows: 0 },
+            Layout::ExpandedNotes { shelf: true, rows: notes::MAX as u8 },
         ];
         for l in all {
             let (w, h, r) = l.dims();

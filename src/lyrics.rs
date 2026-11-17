@@ -160,7 +160,7 @@ fn encode(s: &str) -> String {
     out
 }
 
-fn get(url: &str, referer: Option<&str>) -> Result<String> {
+pub fn get(url: &str, referer: Option<&str>) -> Result<String> {
     let client = HttpClient::new()?;
     let headers = client.DefaultRequestHeaders()?;
     let _ = headers.UserAgent()?.TryParseAdd(h!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) WinDynamicIsland/0.1"));

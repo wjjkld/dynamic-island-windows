@@ -3,9 +3,12 @@
 
 mod audio;
 mod dragdrop;
+mod headset;
 mod island;
 mod lyrics;
+mod notes;
 mod media;
+mod noteinput;
 mod privacy;
 mod render;
 mod settings;
@@ -14,6 +17,7 @@ mod spring;
 mod system;
 mod tray;
 mod volkeys;
+mod weather;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -38,15 +42,18 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, Result, w};
 
 use dragdrop::{DropSink, DropTarget};
-use audio::Audio;
+use audio::{Audio, DeviceEvent};
 use island::{Island, LevelKind, Pace, WIN_H, WIN_W};
 use media::{Cmd, Media};
+use noteinput::{NoteInput, WM_APP_NOTE};
+use notes::Notes;
 use privacy::Privacy;
 use render::Renderer;
 use settings::Settings;
 use shelf::Shelf;
 use tray::{Tray, WM_APP_TRAY};
 use volkeys::{VolKey, VolKeys};
+use weather::Weather;
 
 const WM_APP_WAKE: u32 = WM_APP + 1;
 const MENU_QUIT: usize = 1;
@@ -56,6 +63,7 @@ const MENU_LEVEL: usize = 4;
 const MENU_FULLSCREEN: usize = 5;
 const MENU_AUTOSTART: usize = 6;
 const MENU_SLIM: usize = 7;
+const MENU_WEATHER: usize = 8;
 /// 100 = 主显示器，101.. = 第 n 个显示器。
 const MENU_MONITOR: usize = 100;
 /// 往外拖文件时 OLE 接管消息循环，用这个定时器继续驱动动画。
@@ -73,6 +81,9 @@ struct App {
     settings: Settings,
     audio: Option<Audio>,
     privacy: Privacy,
+    weather: Weather,
+    /// 正在输入的新便签。
+    note_input: Option<NoteInput>,
     tray: Tray,
     _volkeys: Option<VolKeys>,
     /// 亮度通知：注册时会立刻来一次当前值，插拔电源、屏幕变暗/点亮时系统也会自己调亮度，这些都不弹。
@@ -126,7 +137,8 @@ impl App {
         let media = Media::start(wake, settings.lyrics);
         let audio = Audio::new(wake).map_err(|e| eprintln!("[island] 音量监听失败: {e:?}")).ok();
         let privacy = Privacy::start(wake);
-        let mut island = Island::new(media, Shelf::load());
+        let weather = Weather::start(settings.weather, wake);
+        let mut island = Island::new(media, Shelf::load(), Notes::load());
         island.slim = settings.slim_idle;
         unsafe {
             for guid in [GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS, GUID_CONSOLE_DISPLAY_STATE] {
@@ -145,6 +157,8 @@ impl App {
             settings,
             audio,
             privacy,
+            weather,
+            note_input: None,
             tray: Tray::new(hwnd),
             _volkeys: VolKeys::install(on_vol_key),
             brightness: None,
@@ -190,6 +204,15 @@ impl App {
             return;
         }
         self.island.show_level(LevelKind::Brightness, percent as f32 / 100.0, false);
+    }
+
+    /// 便签输入框关了：save 为真时保存输入的文字。
+    fn finish_note(&mut self, save: bool) {
+        // 失去焦点和回车可能先后各来一次，只处理第一次
+        let Some(input) = self.note_input.take() else { return };
+        let text = input.text();
+        drop(input);
+        self.island.end_note(save.then_some(text));
     }
 
     fn to_logical(&self, x: i32, y: i32) -> (f32, f32) {
@@ -247,11 +270,24 @@ impl App {
             }
             self.island.show_level(LevelKind::Volume, v, muted);
         }
-        if let Some((name, v, muted)) = self.audio.as_mut().and_then(|a| a.take_switch()) {
-            self.island.show_device(name, v, muted);
+        match self.audio.as_mut().and_then(|a| a.take_switch()) {
+            Some(DeviceEvent::Default(name, v, muted, battery)) => {
+                let note = if muted { "静音".to_string() } else { format!("{}%", (v * 100.0).round() as i32) };
+                self.island.show_device(name, note, battery);
+            }
+            Some(DeviceEvent::Connected(name, battery)) => self.island.show_device(name, "已连接".into(), battery),
+            None => {}
         }
         if let Some(p) = self.privacy.poll() {
             self.island.set_privacy(p);
+        }
+        // 调试版 ISLAND_DEBUG=weather 用假天气截图，不让真实结果覆盖
+        let fake_weather = cfg!(debug_assertions) && std::env::var("ISLAND_DEBUG").is_ok_and(|v| v == "weather");
+        if let Some(w) = self.weather.poll()
+            && !fake_weather
+        {
+            self.island.weather = w;
+            self.island.dirty = true;
         }
         if self.hidden {
             return 250;
@@ -286,6 +322,18 @@ impl App {
         self.set_click_through(!(inside || catch_drop || self.island.is_scrubbing()));
         self.island.on_mouse(inside, (x, y), now);
         self.island.tick(now);
+        if let Some(r) = self.island.take_note_request() {
+            #[cfg(debug_assertions)]
+            if std::env::var_os("ISLAND_TRACE").is_some() {
+                eprintln!("[note] open at {r:?}");
+            }
+            let px = |v: f32| (v * self.scale).round() as i32;
+            self.note_input =
+                NoteInput::open(self.hwnd, self.origin.x + px(r.x), self.origin.y + px(r.y), px(r.w), px(r.h), self.scale);
+            if self.note_input.is_none() {
+                self.island.end_note(None);
+            }
+        }
 
         let (due, pace) = self.island.pace(now);
         #[cfg(debug_assertions)]
@@ -391,6 +439,7 @@ fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, check(st.level_osd), MENU_LEVEL, w!("音量 / 亮度提示"));
         let _ = AppendMenuW(menu, check(st.hide_in_fullscreen), MENU_FULLSCREEN, w!("全屏时隐藏"));
         let _ = AppendMenuW(menu, check(st.slim_idle), MENU_SLIM, w!("空闲时收成细条"));
+        let _ = AppendMenuW(menu, check(st.weather), MENU_WEATHER, w!("显示天气"));
         if monitors.len() > 1
             && let Ok(sub) = CreatePopupMenu()
         {
@@ -437,6 +486,10 @@ fn show_menu(hwnd: HWND) {
                 MENU_SLIM => {
                     a.settings.slim_idle = !a.settings.slim_idle;
                     a.island.slim = a.settings.slim_idle;
+                }
+                MENU_WEATHER => {
+                    a.settings.weather = !a.settings.weather;
+                    a.weather.set_enabled(a.settings.weather);
                 }
                 MENU_MONITOR => {
                     a.settings.monitor.clear();
@@ -539,6 +592,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             return LRESULT(0);
         }
         WM_APP_WAKE => return LRESULT(0),
+        WM_APP_NOTE => {
+            with_app(|a| a.finish_note(wp.0 != 0));
+            return LRESULT(0);
+        }
         WM_DESTROY => {
             unsafe {
                 let _ = RevokeDragDrop(hwnd);
