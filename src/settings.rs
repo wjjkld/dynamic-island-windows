@@ -16,13 +16,15 @@ pub struct Settings {
     pub level_osd: bool,
     /// 有全屏应用时隐藏。
     pub hide_in_fullscreen: bool,
+    /// 空闲时收成贴顶细条，少挡浏览器标签页。
+    pub slim_idle: bool,
     /// 显示在哪个显示器（设备名，如 \\.\DISPLAY2）；空 = 主显示器。
     pub monitor: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { lyrics: true, level_osd: true, hide_in_fullscreen: true, monitor: String::new() }
+        Settings { lyrics: true, level_osd: true, hide_in_fullscreen: true, slim_idle: false, monitor: String::new() }
     }
 }
 
@@ -42,6 +44,7 @@ impl Settings {
                 "lyrics" => s.lyrics = b,
                 "level_osd" => s.level_osd = b,
                 "hide_in_fullscreen" => s.hide_in_fullscreen = b,
+                "slim_idle" => s.slim_idle = b,
                 "monitor" => s.monitor = v.to_string(),
                 _ => {}
             }
@@ -52,10 +55,11 @@ impl Settings {
     pub fn serialize(&self) -> String {
         let b = |v: bool| if v { 1 } else { 0 };
         format!(
-            "lyrics={}\nlevel_osd={}\nhide_in_fullscreen={}\nmonitor={}\n",
+            "lyrics={}\nlevel_osd={}\nhide_in_fullscreen={}\nslim_idle={}\nmonitor={}\n",
             b(self.lyrics),
             b(self.level_osd),
             b(self.hide_in_fullscreen),
+            b(self.slim_idle),
             self.monitor
         )
     }
@@ -106,7 +110,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let s = Settings { lyrics: false, level_osd: true, hide_in_fullscreen: false, monitor: "\\\\.\\DISPLAY2".into() };
+        let s = Settings { lyrics: false, level_osd: true, hide_in_fullscreen: false, slim_idle: true, monitor: "\\\\.\\DISPLAY2".into() };
         assert_eq!(Settings::parse(&s.serialize()), s);
     }
 

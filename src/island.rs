@@ -10,6 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::media::{ART, Cmd, Media, MediaInfo};
+use crate::privacy::InUse;
 use crate::render::{Color, Image, Rect, Renderer, rgba};
 use crate::shelf::{self, ICON, Shelf};
 use crate::spring::Spring;
@@ -17,12 +18,15 @@ use crate::system::{self, Battery};
 
 /// 窗口逻辑尺寸：容纳最大展开态 + 回弹余量。
 pub const WIN_W: f32 = 460.0;
-pub const WIN_H: f32 = 300.0;
+pub const WIN_H: f32 = 320.0;
 const TOP: f32 = 8.0;
 /// 展开态底部暂存区那一行的高度。
 const SHELF_ROW: f32 = 92.0;
-/// 展开态媒体页的歌词行高度。
+/// 展开态媒体页的歌词行高度（单行 / 带翻译两行）。
 const LYRIC_ROW: f32 = 28.0;
+const LYRIC_ROW2: f32 = 46.0;
+/// 细条形态贴着屏幕顶边。
+const SLIM_TOP: f32 = 2.0;
 const TILE_W: f32 = 68.0;
 const TILE_GAP: f32 = 4.0;
 /// 按住文件拖多远算"拖出去"。
@@ -38,11 +42,12 @@ const WHITE: Color = rgba(1.0, 1.0, 1.0, 1.0);
 const GREEN: Color = rgba(0.29, 0.86, 0.39, 1.0);
 const BLUE: Color = rgba(0.30, 0.62, 1.0, 1.0);
 const ORANGE: Color = rgba(1.0, 0.62, 0.04, 1.0);
+const RED: Color = rgba(1.0, 0.27, 0.23, 1.0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
-    /// files：暂存区里有文件，药丸上显示个数。
-    Idle { files: bool },
+    /// files：暂存区里有文件，药丸上显示个数；slim：收成贴顶的细条，少挡浏览器标签页。
+    Idle { files: bool, slim: bool },
     /// lyric：加宽，中间显示当前歌词。
     Media { lyric: bool },
     TrackToast,
@@ -52,10 +57,15 @@ pub enum Layout {
     /// 计时器倒计时（没有音乐时）。
     Timer,
     TimerDone,
+    LowBattery,
+    /// 默认输出设备换了（插耳机、连蓝牙耳机）。
+    Device,
+    /// 有应用开始用麦克风 / 摄像头。
+    Privacy,
     /// 正在往岛上拖文件。
     Drop,
-    /// shelf：底部多一行暂存的文件；lyric：多一行歌词。
-    ExpandedMedia { shelf: bool, lyric: bool },
+    /// shelf：底部多一行暂存的文件；lyric：歌词行数（0 没有，1 原文，2 原文 + 翻译）。
+    ExpandedMedia { shelf: bool, lyric: u8 },
     ExpandedDash { shelf: bool },
 }
 
@@ -64,8 +74,9 @@ impl Layout {
     pub fn dims(self) -> (f32, f32, f32) {
         let row = |s: bool| if s { SHELF_ROW } else { 0.0 };
         match self {
-            Layout::Idle { files: false } => (120.0, 30.0, 15.0),
-            Layout::Idle { files: true } => (150.0, 30.0, 15.0),
+            Layout::Idle { slim: true, .. } => (100.0, 5.0, 2.5),
+            Layout::Idle { files: false, .. } => (120.0, 30.0, 15.0),
+            Layout::Idle { files: true, .. } => (150.0, 30.0, 15.0),
             Layout::Media { lyric: false } => (250.0, 34.0, 17.0),
             Layout::Media { lyric: true } => (420.0, 34.0, 17.0),
             Layout::TrackToast => (360.0, 34.0, 17.0),
@@ -73,6 +84,8 @@ impl Layout {
             Layout::Level => (320.0, 34.0, 17.0),
             Layout::Timer => (190.0, 34.0, 17.0),
             Layout::TimerDone => (300.0, 34.0, 17.0),
+            Layout::LowBattery => (300.0, 34.0, 17.0),
+            Layout::Device | Layout::Privacy => (350.0, 34.0, 17.0),
             Layout::Drop => (400.0, 120.0, 40.0),
             Layout::ExpandedMedia { shelf, .. } => (400.0, self.base_height() + row(shelf), 40.0),
             Layout::ExpandedDash { shelf } => (400.0, self.base_height() + row(shelf), 36.0),
@@ -82,10 +95,22 @@ impl Layout {
     /// 展开态上半部分（不含暂存区那一行）的高度。
     fn base_height(self) -> f32 {
         match self {
-            Layout::ExpandedMedia { lyric, .. } => 150.0 + if lyric { LYRIC_ROW } else { 0.0 },
+            Layout::ExpandedMedia { lyric, .. } => {
+                150.0
+                    + match lyric {
+                        0 => 0.0,
+                        1 => LYRIC_ROW,
+                        _ => LYRIC_ROW2,
+                    }
+            }
             Layout::ExpandedDash { .. } => 150.0,
             _ => self.dims().1,
         }
+    }
+
+    /// 岛上边缘离屏幕顶的距离。
+    fn top(self) -> f32 {
+        if matches!(self, Layout::Idle { slim: true, .. }) { SLIM_TOP } else { TOP }
     }
 
     fn has_shelf(self) -> bool {
@@ -103,6 +128,9 @@ pub enum Toast {
     Charging,
     Level,
     TimerDone,
+    LowBattery,
+    Device,
+    Privacy,
 }
 
 impl Toast {
@@ -110,6 +138,8 @@ impl Toast {
         match self {
             Toast::Level => Duration::from_millis(1600),
             Toast::TimerDone => Duration::from_secs(6),
+            Toast::LowBattery => Duration::from_secs(4),
+            Toast::Device | Toast::Privacy => Duration::from_secs(3),
             _ => Duration::from_millis(2800),
         }
     }
@@ -126,9 +156,13 @@ pub struct State {
     pub files: bool,
     /// 展开时看的是仪表盘页（有音乐时可以滚轮切过去）。
     pub dash_page: bool,
-    /// 当前歌曲有歌词。
-    pub lyrics: bool,
+    /// 当前歌曲的歌词：0 没有，1 有，2 有并且带翻译。
+    pub lyrics: u8,
     pub timer: bool,
+    /// 设置：空闲时收成细条。
+    pub slim: bool,
+    /// 有应用在用麦克风或摄像头（要显示指示点，不能收成细条）。
+    pub privacy: bool,
 }
 
 /// 选择当前应显示的形态。纯函数，方便测试。
@@ -146,16 +180,19 @@ pub fn choose_layout(s: State) -> Layout {
     match s.toast {
         Some(Toast::Level) => return Layout::Level,
         Some(Toast::TimerDone) => return Layout::TimerDone,
+        Some(Toast::Privacy) => return Layout::Privacy,
+        Some(Toast::LowBattery) => return Layout::LowBattery,
+        Some(Toast::Device) => return Layout::Device,
         Some(Toast::Charging) => return Layout::Charging,
         Some(Toast::Track) if s.media_visible => return Layout::TrackToast,
         _ => {}
     }
     if s.media_visible {
-        Layout::Media { lyric: s.lyrics }
+        Layout::Media { lyric: s.lyrics > 0 }
     } else if s.timer {
         Layout::Timer
     } else {
-        Layout::Idle { files: s.files }
+        Layout::Idle { files: s.files, slim: s.slim && !s.files && !s.privacy }
     }
 }
 
@@ -214,6 +251,7 @@ struct LyricAnim {
     idx: Option<usize>,
     track: u64,
     prev: String,
+    prev_trans: String,
     changed: Instant,
 }
 
@@ -222,6 +260,7 @@ pub struct Island {
     h: Spring,
     r: Spring,
     press: Spring,
+    top: Spring,
     target: Layout,
     shown: Layout,
     content_alpha: f32,
@@ -247,6 +286,11 @@ pub struct Island {
     toast: Option<(Toast, Instant)>,
     level: Option<Level>,
     timer: Option<Timer>,
+    /// 设置：空闲时收成细条。
+    pub slim: bool,
+    privacy: InUse,
+    privacy_msg: (String, bool),
+    device: (String, f32, bool),
 
     pub shelf: Shelf,
     icons: HashMap<u64, Image>,
@@ -278,7 +322,7 @@ pub enum Pace {
 
 impl Island {
     pub fn new(media: Media, shelf: Shelf) -> Self {
-        let start = Layout::Idle { files: !shelf.items.is_empty() };
+        let start = Layout::Idle { files: !shelf.items.is_empty(), slim: false };
         let (w, h, r) = start.dims();
         let now = Instant::now();
         Island {
@@ -286,6 +330,7 @@ impl Island {
             h: Spring::new(h, 0.42, 0.82),
             r: Spring::new(r, 0.42, 0.9),
             press: Spring::new(1.0, 0.25, 0.6),
+            top: Spring::new(TOP, 0.42, 0.9),
             target: start,
             shown: start,
             content_alpha: 1.0,
@@ -299,7 +344,7 @@ impl Island {
             art: None,
             last_track: 0,
             last_playing: None,
-            lyric: LyricAnim { idx: None, track: 0, prev: String::new(), changed: now },
+            lyric: LyricAnim { idx: None, track: 0, prev: String::new(), prev_trans: String::new(), changed: now },
             seek_bar: None,
             bar_hover: false,
             scrub: None,
@@ -307,6 +352,10 @@ impl Island {
             toast: None,
             level: None,
             timer: None,
+            slim: false,
+            privacy: InUse::default(),
+            privacy_msg: (String::new(), false),
+            device: (String::new(), 0.0, false),
             shelf,
             icons: HashMap::new(),
             tiles: Vec::new(),
@@ -327,7 +376,7 @@ impl Island {
     /// 岛当前（动画中）的外框。
     pub fn rect(&self) -> Rect {
         let (w, h) = (self.w.value, self.h.value);
-        Rect::new((WIN_W - w) / 2.0, TOP, w, h)
+        Rect::new((WIN_W - w) / 2.0, self.top.value, w, h)
     }
 
     /// 鼠标是否在岛上（用于决定是否穿透点击）。
@@ -344,6 +393,10 @@ impl Island {
         if let (Some(old), Some(new)) = (self.battery, now_batt) {
             if !old.charging && new.charging {
                 self.show_toast(Toast::Charging);
+            }
+            // 没插电时降到 20%、10% 各提醒一次
+            if !new.charging && [20, 10].iter().any(|&t| old.percent > t && new.percent <= t) {
+                self.show_toast(Toast::LowBattery);
             }
             if old != new {
                 self.dirty = true;
@@ -600,12 +653,56 @@ impl Island {
                     self.bar_hover = true;
                 }
             }
+            "trans" => {
+                self.debug_preset("media_x");
+                let lrc = "[01:30.00]Look at the stars\n[01:34.50]Look how they shine for you\n[01:38.00]And everything you do";
+                let tl = "[01:30.00]看看那些星星\n[01:34.50]看它们为你闪耀\n[01:38.00]还有你做的一切";
+                self.info.lyrics = Some(std::sync::Arc::new(crate::lyrics::build(lrc, Some(tl))));
+                self.info.title = "Yellow".into();
+                self.info.artist = "Coldplay".into();
+            }
+            "privacy" => self.set_privacy(InUse { mic: vec!["WeChat".into()], cam: vec![] }),
+            "dots" => {
+                self.set_privacy(InUse { mic: vec!["WeChat".into()], cam: vec!["Zoom".into()] });
+                self.toast = None;
+            }
+            "device" => self.show_device("耳机 (WH-1000XM5)".into(), 0.36, false),
+            "lowbatt" => {
+                self.battery = Some(Battery { percent: 19, charging: false });
+                self.show_toast(Toast::LowBattery);
+            }
+            "slim" => self.slim = true,
             "dash0" => {
                 self.expanded = true;
                 self.pin = true;
             }
             _ => {}
         }
+        self.dirty = true;
+    }
+
+    /// 输出设备换了：显示设备名和它的音量。
+    pub fn show_device(&mut self, name: String, volume: f32, muted: bool) {
+        self.device = (name, volume, muted);
+        self.show_toast(Toast::Device);
+    }
+
+    /// 麦克风 / 摄像头占用情况变了；有新应用开始用时弹一下。
+    pub fn set_privacy(&mut self, now: InUse) {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ISLAND_TRACE").is_some() {
+            eprintln!("[privacy] {now:?}");
+        }
+        let new_cam = now.cam.iter().find(|a| !self.privacy.cam.contains(a));
+        let new_mic = now.mic.iter().find(|a| !self.privacy.mic.contains(a));
+        if let Some(app) = new_cam {
+            self.privacy_msg = (format!("{app} 正在使用摄像头"), true);
+            self.show_toast(Toast::Privacy);
+        } else if let Some(app) = new_mic {
+            self.privacy_msg = (format!("{app} 正在使用麦克风"), false);
+            self.show_toast(Toast::Privacy);
+        }
+        self.privacy = now;
         self.dirty = true;
     }
 
@@ -653,8 +750,14 @@ impl Island {
             media_visible,
             files: !self.shelf.items.is_empty(),
             dash_page: self.dash_page,
-            lyrics: self.info.lyrics.is_some(),
+            lyrics: match &self.info.lyrics {
+                None => 0,
+                Some(l) if l.lines.iter().any(|x| x.trans.is_some()) => 2,
+                Some(_) => 1,
+            },
             timer: self.timer.is_some(),
+            slim: self.slim,
+            privacy: self.privacy.any(),
         });
         if target != self.target {
             self.target = target;
@@ -662,6 +765,7 @@ impl Island {
             self.w.target = w;
             self.h.target = h;
             self.r.target = r;
+            self.top.target = target.top();
         }
 
         // 内容先淡出，换成新形态的内容后，随尺寸接近目标再淡入。
@@ -681,7 +785,7 @@ impl Island {
             self.content_alpha = (self.content_alpha + dt / 0.22).min(1.0);
         }
 
-        for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press] {
+        for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press, &mut self.top] {
             s.step(dt);
         }
         if let Some(l) = &mut self.level {
@@ -697,11 +801,24 @@ impl Island {
         }
     }
 
+    fn lyric_trans(&self, idx: Option<usize>) -> &str {
+        match (&self.info.lyrics, idx) {
+            (Some(l), Some(i)) => l.lines.get(i).and_then(|l| l.trans.as_deref()).unwrap_or(""),
+            _ => "",
+        }
+    }
+
     fn update_lyric(&mut self, now: Instant) {
         let idx = self.info.lyrics.as_ref().and_then(|l| l.index_at(self.info.position_now()));
         if idx != self.lyric.idx || self.lyric.track != self.info.track_id {
             let same_track = self.lyric.track == self.info.track_id;
-            self.lyric.prev = if same_track { self.lyric_text(self.lyric.idx).to_string() } else { String::new() };
+            let (prev, prev_trans) = if same_track {
+                (self.lyric_text(self.lyric.idx).to_string(), self.lyric_trans(self.lyric.idx).to_string())
+            } else {
+                Default::default()
+            };
+            self.lyric.prev = prev;
+            self.lyric.prev_trans = prev_trans;
             self.lyric.idx = idx;
             self.lyric.track = self.info.track_id;
             self.lyric.changed = now;
@@ -711,7 +828,7 @@ impl Island {
 
     fn animating(&self) -> bool {
         let level_moving = self.shown == Layout::Level && self.level.as_ref().is_some_and(|l| !l.fill.settled());
-        !(self.w.settled() && self.h.settled() && self.r.settled() && self.press.settled())
+        !(self.w.settled() && self.h.settled() && self.r.settled() && self.press.settled() && self.top.settled())
             || self.shown != self.target
             || self.content_alpha < 1.0
             || level_moving
@@ -784,9 +901,12 @@ impl Island {
             let inset = (radius * 0.3).min(8.0);
             g.push_clip(Rect::new(r.x, r.y + inset, r.w, r.h - 2.0 * inset));
             match self.shown {
-                Layout::Idle { files } => {
+                Layout::Idle { files, slim } => {
                     if files {
                         self.draw_idle_files(g, r, a);
+                    }
+                    if !slim {
+                        self.draw_privacy_dots(g, r.x + 14.0, r.y + r.h / 2.0, a);
                     }
                 }
                 Layout::Media { lyric } => self.draw_compact(g, r, a, if lyric { Middle::Lyric } else { Middle::None }),
@@ -795,6 +915,9 @@ impl Island {
                 Layout::Level => self.draw_level(g, r, a),
                 Layout::Timer => self.draw_timer_compact(g, r, a),
                 Layout::TimerDone => self.draw_timer_done(g, r, a),
+                Layout::LowBattery => self.draw_low_battery(g, r, a),
+                Layout::Device => self.draw_device(g, r, a),
+                Layout::Privacy => self.draw_privacy_toast(g, r, a),
                 Layout::Drop => self.draw_drop(g, r, a),
                 Layout::ExpandedMedia { lyric, .. } => self.draw_expanded_media(g, r, a, lyric),
                 Layout::ExpandedDash { .. } => self.draw_dash(g, r, a),
@@ -920,19 +1043,40 @@ impl Island {
         }
     }
 
-    /// 当前歌词，换行时旧行上滑淡出、新行从下方滑入。
-    fn draw_lyric(&self, g: &Renderer, rect: Rect, a: f32, c: Color) {
+    /// 当前歌词，换行时旧行上滑淡出、新行从下方滑入。trans：在下面再画一行翻译。
+    fn draw_lyric(&self, g: &Renderer, rect: Rect, a: f32, c: Color, trans: bool) {
         let p = (self.lyric.changed.elapsed().as_secs_f32() / LYRIC_ANIM).clamp(0.0, 1.0);
         let e = 1.0 - (1.0 - p) * (1.0 - p);
         let shift = 9.0;
         let cur = self.lyric_text(self.lyric.idx);
         let cur = if cur.is_empty() { "♪" } else { cur };
+        let cur_trans = self.lyric_trans(self.lyric.idx);
+        let trans_rect = |r: Rect| Rect::new(r.x, r.y + 20.0, r.w, 18.0);
+        let tc = with_alpha(c, 0.6);
         if p < 1.0 && !self.lyric.prev.is_empty() {
             let old = Rect::new(rect.x, rect.y - e * shift, rect.w, rect.h);
             g.text(&self.lyric.prev, &g.fonts.lyric_center, old, with_alpha(c, a * (1.0 - e)));
+            if trans && !self.lyric.prev_trans.is_empty() {
+                g.text(&self.lyric.prev_trans, &g.fonts.small_center, trans_rect(old), with_alpha(tc, a * (1.0 - e)));
+            }
         }
         let new = Rect::new(rect.x, rect.y + (1.0 - e) * shift, rect.w, rect.h);
         g.text(cur, &g.fonts.lyric_center, new, with_alpha(c, a * e));
+        if trans && !cur_trans.is_empty() {
+            g.text(cur_trans, &g.fonts.small_center, trans_rect(new), with_alpha(tc, a * e));
+        }
+    }
+
+    /// 隐私指示点：绿色 = 摄像头，橙色 = 麦克风（和 macOS 一致）。返回占用的宽度。
+    fn draw_privacy_dots(&self, g: &Renderer, x: f32, cy: f32, a: f32) -> f32 {
+        let mut dx = 0.0;
+        for (on, c) in [(!self.privacy.cam.is_empty(), GREEN), (!self.privacy.mic.is_empty(), ORANGE)] {
+            if on {
+                g.fill_rrect(Rect::new(x + dx, cy - 3.0, 6.0, 6.0), 3.0, with_alpha(c, a));
+                dx += 10.0;
+            }
+        }
+        dx
     }
 
     fn timer_text(&self) -> String {
@@ -968,11 +1112,12 @@ impl Island {
         } else {
             self.draw_bars(g, r.x + r.w - 14.0, r.y + r.h / 2.0, 14.0, a);
         }
-        let mid = Rect::new(r.x + 38.0, r.y, r.w - 38.0 - 62.0, r.h);
+        let dots = self.draw_privacy_dots(g, art.x + art.w + 7.0, r.y + r.h / 2.0, a);
+        let mid = Rect::new(r.x + 38.0 + dots, r.y, r.w - 38.0 - dots - 62.0, r.h);
         match middle {
             Middle::None => {}
             Middle::Title => g.text(&self.info.title, &g.fonts.small, mid, with_alpha(WHITE, a)),
-            Middle::Lyric => self.draw_lyric(g, Rect::new(mid.x + 4.0, r.y, mid.w - 8.0, r.h), a, WHITE),
+            Middle::Lyric => self.draw_lyric(g, Rect::new(mid.x + 4.0, r.y, mid.w - 8.0, r.h), a, WHITE, false),
         }
     }
 
@@ -1047,7 +1192,42 @@ impl Island {
         let cx = r.x + 20.0;
         g.arc(cx, cy, 8.0, 1.0, 2.5, with_alpha(ORANGE, 0.25 * a));
         g.arc(cx, cy, 8.0, self.timer_frac(), 2.5, with_alpha(ORANGE, a));
+        self.draw_privacy_dots(g, cx + 16.0, cy, a);
         g.text(&self.timer_text(), &g.fonts.title, Rect::new(r.x + r.w - 16.0 - 80.0, r.y, 80.0, r.h), with_alpha(ORANGE, a));
+    }
+
+    fn draw_low_battery(&self, g: &Renderer, r: Rect, a: f32) {
+        let cy = r.y + r.h / 2.0;
+        g.text("电量不足", &g.fonts.small, Rect::new(r.x + 18.0, r.y, 120.0, r.h), with_alpha(WHITE, a));
+        if let Some(b) = self.battery {
+            let bx = r.x + r.w - 16.0 - 26.0;
+            self.draw_battery(g, bx, cy, b, a);
+            g.text(&format!("{}%", b.percent), &g.fonts.small_right, Rect::new(bx - 66.0, r.y, 60.0, r.h), with_alpha(RED, a));
+        }
+    }
+
+    /// 耳机图标 + 设备名 + 音量。
+    fn draw_device(&self, g: &Renderer, r: Rect, a: f32) {
+        let cy = r.y + r.h / 2.0;
+        let (hx, c) = (r.x + 24.0, with_alpha(WHITE, a));
+        // 头梁：只画圆的上半部分
+        g.push_clip(Rect::new(hx - 9.0, cy - 9.0, 18.0, 9.5));
+        g.arc(hx, cy + 0.5, 7.0, 1.0, 1.8, c);
+        g.pop_clip();
+        g.fill_rrect(Rect::new(hx - 8.5, cy, 4.0, 7.0), 1.5, c);
+        g.fill_rrect(Rect::new(hx + 4.5, cy, 4.0, 7.0), 1.5, c);
+        let (name, volume, muted) = &self.device;
+        g.text(name, &g.fonts.small, Rect::new(hx + 16.0, r.y, r.w - 24.0 - 16.0 - 70.0, r.h), c);
+        let pct = if *muted { "静音".to_string() } else { format!("{}%", (volume * 100.0).round() as i32) };
+        g.text(&pct, &g.fonts.small_right, Rect::new(r.x + r.w - 18.0 - 50.0, r.y, 50.0, r.h), with_alpha(WHITE, 0.6 * a));
+    }
+
+    fn draw_privacy_toast(&self, g: &Renderer, r: Rect, a: f32) {
+        let cy = r.y + r.h / 2.0;
+        let (msg, cam) = &self.privacy_msg;
+        let c = if *cam { GREEN } else { ORANGE };
+        g.fill_rrect(Rect::new(r.x + 16.0, cy - 4.5, 9.0, 9.0), 4.5, with_alpha(c, a));
+        g.text(msg, &g.fonts.small, Rect::new(r.x + 36.0, r.y, r.w - 36.0 - 16.0, r.h), with_alpha(WHITE, a));
     }
 
     fn draw_timer_done(&self, g: &Renderer, r: Rect, a: f32) {
@@ -1059,7 +1239,7 @@ impl Island {
         g.text("计时结束", &g.fonts.small, Rect::new(cx + 18.0, r.y, 140.0, r.h), with_alpha(WHITE, a));
     }
 
-    fn draw_expanded_media(&mut self, g: &Renderer, r: Rect, a: f32, lyric: bool) {
+    fn draw_expanded_media(&mut self, g: &Renderer, r: Rect, a: f32, lyric: u8) {
         let pad = 20.0;
         let art = Rect::new(r.x + pad, r.y + pad, 62.0, 62.0);
         self.draw_art(g, art, 14.0, a);
@@ -1071,9 +1251,10 @@ impl Island {
         self.draw_bars(g, r.x + r.w - pad, art.y + 19.0, 16.0, a);
 
         let mut row_y = art.y + art.h + 14.0;
-        if lyric {
-            self.draw_lyric(g, Rect::new(r.x + pad, row_y - 6.0, r.w - 2.0 * pad, 24.0), a, self.accent());
-            row_y += LYRIC_ROW;
+        if lyric > 0 {
+            let two = lyric >= 2;
+            self.draw_lyric(g, Rect::new(r.x + pad, row_y - 6.0, r.w - 2.0 * pad, 24.0), a, self.accent(), two);
+            row_y += if two { LYRIC_ROW2 } else { LYRIC_ROW };
         }
         if self.info.duration > 1.0 {
             let pos = match self.scrub {
@@ -1171,10 +1352,10 @@ mod tests {
 
     #[test]
     fn expanded_wins() {
-        assert_eq!(choose_layout(st(true, Some(Toast::Charging), true, true)), Layout::ExpandedMedia { shelf: false, lyric: false });
+        assert_eq!(choose_layout(st(true, Some(Toast::Charging), true, true)), Layout::ExpandedMedia { shelf: false, lyric: 0 });
         assert_eq!(choose_layout(st(true, None, false, false)), Layout::ExpandedDash { shelf: false });
-        let with_files = State { files: true, lyrics: true, ..st(true, None, true, true) };
-        assert_eq!(choose_layout(with_files), Layout::ExpandedMedia { shelf: true, lyric: true });
+        let with_files = State { files: true, lyrics: 2, ..st(true, None, true, true) };
+        assert_eq!(choose_layout(with_files), Layout::ExpandedMedia { shelf: true, lyric: 2 });
     }
 
     #[test]
@@ -1196,10 +1377,13 @@ mod tests {
         assert_eq!(choose_layout(st(false, Some(Toast::TimerDone), false, false)), Layout::TimerDone);
         assert_eq!(choose_layout(st(false, Some(Toast::Track), true, true)), Layout::TrackToast);
         // 音乐已经隐藏时，切歌提示不弹
-        assert_eq!(choose_layout(st(false, Some(Toast::Track), true, false)), Layout::Idle { files: false });
+        assert_eq!(choose_layout(st(false, Some(Toast::Track), true, false)), Layout::Idle { files: false, slim: false });
         assert_eq!(choose_layout(st(false, None, true, true)), Layout::Media { lyric: false });
-        assert_eq!(choose_layout(State { lyrics: true, ..st(false, None, true, true) }), Layout::Media { lyric: true });
-        assert_eq!(choose_layout(State { files: true, ..st(false, None, false, false) }), Layout::Idle { files: true });
+        assert_eq!(choose_layout(State { lyrics: 1, ..st(false, None, true, true) }), Layout::Media { lyric: true });
+        assert_eq!(choose_layout(State { files: true, ..st(false, None, false, false) }), Layout::Idle { files: true, slim: false });
+        assert_eq!(choose_layout(st(false, Some(Toast::LowBattery), true, true)), Layout::LowBattery);
+        assert_eq!(choose_layout(st(false, Some(Toast::Device), true, true)), Layout::Device);
+        assert_eq!(choose_layout(st(false, Some(Toast::Privacy), false, false)), Layout::Privacy);
     }
 
     #[test]
@@ -1210,10 +1394,21 @@ mod tests {
     }
 
     #[test]
+    fn slim_only_when_nothing_to_show() {
+        let slim = State { slim: true, ..st(false, None, false, false) };
+        assert_eq!(choose_layout(slim), Layout::Idle { files: false, slim: true });
+        // 有暂存文件、有应用在用麦克风时要露出药丸
+        assert_eq!(choose_layout(State { files: true, ..slim }), Layout::Idle { files: true, slim: false });
+        assert_eq!(choose_layout(State { privacy: true, ..slim }), Layout::Idle { files: false, slim: false });
+        assert_eq!(Layout::Idle { files: false, slim: true }.top(), SLIM_TOP);
+    }
+
+    #[test]
     fn every_layout_fits_window() {
         let all = [
-            Layout::Idle { files: false },
-            Layout::Idle { files: true },
+            Layout::Idle { files: false, slim: false },
+            Layout::Idle { files: false, slim: true },
+            Layout::Idle { files: true, slim: false },
             Layout::Media { lyric: false },
             Layout::Media { lyric: true },
             Layout::TrackToast,
@@ -1221,9 +1416,12 @@ mod tests {
             Layout::Level,
             Layout::Timer,
             Layout::TimerDone,
+            Layout::LowBattery,
+            Layout::Device,
+            Layout::Privacy,
             Layout::Drop,
-            Layout::ExpandedMedia { shelf: false, lyric: false },
-            Layout::ExpandedMedia { shelf: true, lyric: true },
+            Layout::ExpandedMedia { shelf: false, lyric: 0 },
+            Layout::ExpandedMedia { shelf: true, lyric: 2 },
             Layout::ExpandedDash { shelf: false },
             Layout::ExpandedDash { shelf: true },
         ];

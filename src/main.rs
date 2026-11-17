@@ -6,12 +6,14 @@ mod dragdrop;
 mod island;
 mod lyrics;
 mod media;
+mod privacy;
 mod render;
 mod settings;
 mod shelf;
 mod spring;
 mod system;
 mod tray;
+mod volkeys;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -25,12 +27,11 @@ use windows::Win32::System::Ole::{
     DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, IDropSource, OleInitialize, RegisterDragDrop, RevokeDragDrop,
 };
 use windows::Win32::System::Power::{POWERBROADCAST_SETTING, RegisterPowerSettingNotification};
-use windows::Win32::System::SystemInformation::GetTickCount;
-use windows::Win32::System::SystemServices::GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS;
+use windows::Win32::System::SystemServices::{GUID_CONSOLE_DISPLAY_STATE, GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetLastInputInfo, LASTINPUTINFO, ReleaseCapture, SetCapture, VK_LBUTTON,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_LBUTTON,
 };
 use windows::Win32::UI::Shell::SHDoDragDrop;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -40,10 +41,12 @@ use dragdrop::{DropSink, DropTarget};
 use audio::Audio;
 use island::{Island, LevelKind, Pace, WIN_H, WIN_W};
 use media::{Cmd, Media};
+use privacy::Privacy;
 use render::Renderer;
 use settings::Settings;
 use shelf::Shelf;
 use tray::{Tray, WM_APP_TRAY};
+use volkeys::{VolKey, VolKeys};
 
 const WM_APP_WAKE: u32 = WM_APP + 1;
 const MENU_QUIT: usize = 1;
@@ -52,6 +55,7 @@ const MENU_LYRICS: usize = 3;
 const MENU_LEVEL: usize = 4;
 const MENU_FULLSCREEN: usize = 5;
 const MENU_AUTOSTART: usize = 6;
+const MENU_SLIM: usize = 7;
 /// 100 = 主显示器，101.. = 第 n 个显示器。
 const MENU_MONITOR: usize = 100;
 /// 往外拖文件时 OLE 接管消息循环，用这个定时器继续驱动动画。
@@ -68,10 +72,15 @@ struct App {
     monitor: HMONITOR,
     settings: Settings,
     audio: Option<Audio>,
+    privacy: Privacy,
     tray: Tray,
-    /// 亮度通知：注册时会立刻来一次当前值，插拔电源时系统也会自己调亮度，这些都不弹。
+    _volkeys: Option<VolKeys>,
+    /// 亮度通知：注册时会立刻来一次当前值，插拔电源、屏幕变暗/点亮时系统也会自己调亮度，这些都不弹。
     brightness: Option<u32>,
     power_changed: Instant,
+    /// 屏幕状态：0 关、1 开、2 变暗。
+    display_state: u32,
+    display_changed: Instant,
     last_sys: Instant,
     lbutton: bool,
     /// 左键是在窗口外按下的，现在按着进了窗口：可能是在拖文件过来。
@@ -116,13 +125,18 @@ impl App {
         };
         let media = Media::start(wake, settings.lyrics);
         let audio = Audio::new(wake).map_err(|e| eprintln!("[island] 音量监听失败: {e:?}")).ok();
+        let privacy = Privacy::start(wake);
+        let mut island = Island::new(media, Shelf::load());
+        island.slim = settings.slim_idle;
         unsafe {
-            let _ = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS, DEVICE_NOTIFY_WINDOW_HANDLE);
+            for guid in [GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS, GUID_CONSOLE_DISPLAY_STATE] {
+                let _ = RegisterPowerSettingNotification(HANDLE(hwnd.0), &guid, DEVICE_NOTIFY_WINDOW_HANDLE);
+            }
         }
         Ok(App {
             hwnd,
             renderer,
-            island: Island::new(media, Shelf::load()),
+            island,
             scale,
             origin,
             click_through: true,
@@ -130,9 +144,13 @@ impl App {
             monitor,
             settings,
             audio,
+            privacy,
             tray: Tray::new(hwnd),
+            _volkeys: VolKeys::install(on_vol_key),
             brightness: None,
             power_changed: Instant::now(),
+            display_state: 1,
+            display_changed: Instant::now(),
             last_sys: Instant::now(),
             lbutton: false,
             drag_candidate: false,
@@ -161,8 +179,13 @@ impl App {
         let first = self.brightness.is_none();
         let same = self.brightness == Some(percent);
         self.brightness = Some(percent);
-        // 只在用户刚动过键盘鼠标时显示：排除空闲变暗、插拔电源时的自动调节
-        let auto = self.power_changed.elapsed() < Duration::from_secs(2) || idle_ms() > 3000;
+        // 排除系统自己调的：插拔电源、空闲变暗以及恢复
+        let recent = |t: Instant| t.elapsed() < Duration::from_secs(2);
+        let auto = recent(self.power_changed) || recent(self.display_changed) || self.display_state != 1;
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ISLAND_TRACE").is_some() {
+            eprintln!("[brightness] {percent}% first={first} same={same} auto={auto}");
+        }
         if first || same || auto || !self.settings.level_osd {
             return;
         }
@@ -196,6 +219,12 @@ impl App {
                 && std::env::var_os("ISLAND_ALWAYS_SHOW").is_none()
                 && system::fullscreen_app_running(self.monitor);
             if full != self.hidden {
+                #[cfg(debug_assertions)]
+                if std::env::var_os("ISLAND_TRACE").is_some() {
+                    let mut buf = [0u16; 64];
+                    let n = unsafe { GetClassNameW(GetForegroundWindow(), &mut buf) } as usize;
+                    eprintln!("[fullscreen] hidden={full} fg={}", String::from_utf16_lossy(&buf[..n]));
+                }
                 self.hidden = full;
                 unsafe {
                     let _ = ShowWindow(self.hwnd, if full { SW_HIDE } else { SW_SHOWNOACTIVATE });
@@ -212,7 +241,17 @@ impl App {
         if let Some((v, muted)) = self.audio.as_mut().and_then(|a| a.poll())
             && self.settings.level_osd
         {
+            #[cfg(debug_assertions)]
+            if std::env::var_os("ISLAND_TRACE").is_some() {
+                eprintln!("[audio] volume={v:.2} muted={muted}");
+            }
             self.island.show_level(LevelKind::Volume, v, muted);
+        }
+        if let Some((name, v, muted)) = self.audio.as_mut().and_then(|a| a.take_switch()) {
+            self.island.show_device(name, v, muted);
+        }
+        if let Some(p) = self.privacy.poll() {
+            self.island.set_privacy(p);
         }
         if self.hidden {
             return 250;
@@ -285,6 +324,12 @@ fn drag_out(hwnd: HWND, path: PathBuf) {
     with_app(|a| a.island.drag_out_done());
 }
 
+/// 音量键：岛显示着、开着音量提示时由岛接管，系统的音量浮窗不再出现；
+/// 岛因全屏隐藏时交还给系统，免得调音量没有任何反馈。
+fn on_vol_key(key: VolKey) -> bool {
+    with_app(|a| a.settings.level_osd && !a.hidden && a.audio.as_ref().is_some_and(|au| au.press(key))).unwrap_or(false)
+}
+
 /// 调试版：ISLAND_TRACE=1 时每秒打印一次循环、出帧、动画帧的次数，用来查空闲耗电。
 #[cfg(debug_assertions)]
 fn trace(rendered: bool, animating: bool, hidden: bool) {
@@ -301,17 +346,6 @@ fn trace(rendered: bool, animating: bool, hidden: bool) {
         T.set((Instant::now(), 0, 0, 0));
     } else {
         T.set(next);
-    }
-}
-
-/// 距离上次键盘鼠标输入多少毫秒。
-fn idle_ms() -> u32 {
-    let mut li = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
-    unsafe {
-        if !GetLastInputInfo(&mut li).as_bool() {
-            return 0;
-        }
-        GetTickCount().wrapping_sub(li.dwTime)
     }
 }
 
@@ -356,6 +390,7 @@ fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, check(st.lyrics), MENU_LYRICS, w!("显示歌词"));
         let _ = AppendMenuW(menu, check(st.level_osd), MENU_LEVEL, w!("音量 / 亮度提示"));
         let _ = AppendMenuW(menu, check(st.hide_in_fullscreen), MENU_FULLSCREEN, w!("全屏时隐藏"));
+        let _ = AppendMenuW(menu, check(st.slim_idle), MENU_SLIM, w!("空闲时收成细条"));
         if monitors.len() > 1
             && let Ok(sub) = CreatePopupMenu()
         {
@@ -399,6 +434,10 @@ fn show_menu(hwnd: HWND) {
                 }
                 MENU_LEVEL => a.settings.level_osd = !a.settings.level_osd,
                 MENU_FULLSCREEN => a.settings.hide_in_fullscreen = !a.settings.hide_in_fullscreen,
+                MENU_SLIM => {
+                    a.settings.slim_idle = !a.settings.slim_idle;
+                    a.island.slim = a.settings.slim_idle;
+                }
                 MENU_MONITOR => {
                     a.settings.monitor.clear();
                     a.reposition();
@@ -470,11 +509,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 PBT_POWERSETTINGCHANGE => {
                     let setting = unsafe { (lp.0 as *const POWERBROADCAST_SETTING).as_ref() };
                     if let Some(s) = setting
-                        && s.PowerSetting == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS
                         && s.DataLength >= 4
                     {
                         let v = unsafe { std::ptr::read_unaligned(s.Data.as_ptr() as *const u32) };
-                        with_app(|a| a.on_brightness(v));
+                        if s.PowerSetting == GUID_VIDEO_CURRENT_MONITOR_BRIGHTNESS {
+                            with_app(|a| a.on_brightness(v));
+                        } else if s.PowerSetting == GUID_CONSOLE_DISPLAY_STATE {
+                            with_app(|a| {
+                                a.display_state = v;
+                                a.display_changed = Instant::now();
+                            });
+                        }
                     }
                 }
                 _ => {}
