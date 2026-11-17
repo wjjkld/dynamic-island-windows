@@ -1,4 +1,4 @@
-//! 新建便签的输入框：一个盖在岛上第一行的小窗口，里面放系统的 EDIT 控件，
+//! 岛上的输入框（新建便签、设置天气城市）：一个盖在岛上第一行的小窗口，里面放系统的 EDIT 控件，
 //! 这样中文输入法、复制粘贴、光标移动都是现成的。
 //! 回车保存、Esc 取消、点别处（失去焦点）也保存；结果用 WM_APP_NOTE 发回岛的窗口。
 
@@ -24,6 +24,8 @@ use crate::notes;
 pub const WM_APP_NOTE: u32 = WM_APP + 5;
 /// EM_LIMITTEXT：限制输入长度。
 const EM_LIMITTEXT: u32 = 0x00C5;
+/// EM_SETSEL：选中一段文字。
+const EM_SETSEL: u32 = 0x00B1;
 
 /// 输入框底色，和岛上画的那一行一样（0.17, 0.17, 0.18）。
 const BG: COLORREF = COLORREF(0x002E2B2B);
@@ -60,7 +62,7 @@ fn class() -> PCWSTR {
 
 impl NoteInput {
     /// (x, y, w, h)：屏幕物理像素。
-    pub fn open(owner: HWND, x: i32, y: i32, w: i32, h: i32, scale: f32) -> Option<NoteInput> {
+    pub fn open(owner: HWND, x: i32, y: i32, w: i32, h: i32, scale: f32, initial: &str) -> Option<NoteInput> {
         unsafe {
             let hinst = GetModuleHandleW(None).ok()?;
             let hwnd = CreateWindowExW(
@@ -122,6 +124,11 @@ impl NoteInput {
             .ok()?;
             SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
             SendMessageW(edit, EM_LIMITTEXT, Some(WPARAM(notes::MAX_CHARS)), None);
+            if !initial.is_empty() {
+                let _ = SetWindowTextW(edit, &windows::core::HSTRING::from(initial));
+                // 全选，直接打字就替换
+                SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+            }
             let _ = SetWindowSubclass(edit, Some(edit_proc), 1, owner.0 as usize);
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);

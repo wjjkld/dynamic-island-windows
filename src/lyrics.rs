@@ -149,7 +149,7 @@ fn is_cjk(c: char) -> bool {
     matches!(c as u32, 0x3040..=0x30ff | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xac00..=0xd7af)
 }
 
-fn encode(s: &str) -> String {
+pub fn encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {

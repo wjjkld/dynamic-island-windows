@@ -43,7 +43,7 @@ use windows::core::{HSTRING, Result, w};
 
 use dragdrop::{DropSink, DropTarget};
 use audio::{Audio, DeviceEvent};
-use island::{Island, LevelKind, Pace, WIN_H, WIN_W};
+use island::{Input, Island, LevelKind, Pace, WIN_H, WIN_W};
 use media::{Cmd, Media};
 use noteinput::{NoteInput, WM_APP_NOTE};
 use notes::Notes;
@@ -83,7 +83,7 @@ struct App {
     privacy: Privacy,
     weather: Weather,
     /// 正在输入的新便签。
-    note_input: Option<NoteInput>,
+    note_input: Option<(Input, NoteInput)>,
     tray: Tray,
     _volkeys: Option<VolKeys>,
     /// 亮度通知：注册时会立刻来一次当前值，插拔电源、屏幕变暗/点亮时系统也会自己调亮度，这些都不弹。
@@ -137,7 +137,7 @@ impl App {
         let media = Media::start(wake, settings.lyrics);
         let audio = Audio::new(wake).map_err(|e| eprintln!("[island] 音量监听失败: {e:?}")).ok();
         let privacy = Privacy::start(wake);
-        let weather = Weather::start(settings.weather, wake);
+        let weather = Weather::start(settings.weather, settings.weather_city.clone(), wake);
         let mut island = Island::new(media, Shelf::load(), Notes::load());
         island.slim = settings.slim_idle;
         unsafe {
@@ -206,13 +206,21 @@ impl App {
         self.island.show_level(LevelKind::Brightness, percent as f32 / 100.0, false);
     }
 
-    /// 便签输入框关了：save 为真时保存输入的文字。
-    fn finish_note(&mut self, save: bool) {
+    /// 输入框关了：save 为真时保存输入的文字（新便签或天气城市）。
+    fn finish_input(&mut self, save: bool) {
         // 失去焦点和回车可能先后各来一次，只处理第一次
-        let Some(input) = self.note_input.take() else { return };
+        let Some((kind, input)) = self.note_input.take() else { return };
         let text = input.text();
         drop(input);
-        self.island.end_note(save.then_some(text));
+        if save && kind == Input::City {
+            let city = text.trim().to_string();
+            if city != self.settings.weather_city {
+                self.settings.weather_city = city.clone();
+                self.settings.save();
+                self.weather.set_city(city);
+            }
+        }
+        self.island.end_input(kind, save.then_some(text.as_str()));
     }
 
     fn to_logical(&self, x: i32, y: i32) -> (f32, f32) {
@@ -322,16 +330,17 @@ impl App {
         self.set_click_through(!(inside || catch_drop || self.island.is_scrubbing()));
         self.island.on_mouse(inside, (x, y), now);
         self.island.tick(now);
-        if let Some(r) = self.island.take_note_request() {
+        if let Some((kind, r)) = self.island.take_input_request() {
             #[cfg(debug_assertions)]
             if std::env::var_os("ISLAND_TRACE").is_some() {
-                eprintln!("[note] open at {r:?}");
+                eprintln!("[input] {kind:?} at {r:?}");
             }
             let px = |v: f32| (v * self.scale).round() as i32;
-            self.note_input =
-                NoteInput::open(self.hwnd, self.origin.x + px(r.x), self.origin.y + px(r.y), px(r.w), px(r.h), self.scale);
-            if self.note_input.is_none() {
-                self.island.end_note(None);
+            let initial = if kind == Input::City { self.settings.weather_city.clone() } else { String::new() };
+            let (x, y) = (self.origin.x + px(r.x), self.origin.y + px(r.y));
+            match NoteInput::open(self.hwnd, x, y, px(r.w), px(r.h), self.scale, &initial) {
+                Some(input) => self.note_input = Some((kind, input)),
+                None => self.island.end_input(kind, None),
             }
         }
 
@@ -593,7 +602,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_APP_WAKE => return LRESULT(0),
         WM_APP_NOTE => {
-            with_app(|a| a.finish_note(wp.0 != 0));
+            with_app(|a| a.finish_input(wp.0 != 0));
             return LRESULT(0);
         }
         WM_DESTROY => {

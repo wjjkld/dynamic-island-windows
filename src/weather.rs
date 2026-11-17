@@ -2,7 +2,8 @@
 //!
 //! 先问 wttr.in（国内访问快），不通再问 Open-Meteo；两个都免费、不用密钥。
 //! 只发送保留一位小数的经纬度（约 10 公里精度），不发送其它信息。每 30 分钟更新一次。
-//! 系统定位没开（设置 → 隐私和安全性 → 位置 → 允许桌面应用访问你的位置）时不查，仪表盘上给出提示。
+//! 系统定位用不了（定位关着、不让桌面应用用、地理位置服务被禁用）时，改用用户手动设置的城市名去查；
+//! 两样都没有时仪表盘上给出提示。
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,8 @@ pub struct Now {
     pub desc: &'static str,
     pub icon: Icon,
     pub is_day: bool,
+    /// 按手动设置的城市查的：显示城市名，方便发现设错了。
+    pub city: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -39,24 +42,34 @@ pub enum State {
 
 type Shared = Arc<Mutex<(u64, State)>>;
 
+enum Msg {
+    Enabled(bool),
+    City(String),
+}
+
 pub struct Weather {
     shared: Shared,
     seen: u64,
-    tx: Sender<bool>,
+    tx: Sender<Msg>,
 }
 
 impl Weather {
-    pub fn start(on: bool, wake: impl Fn() + Send + 'static) -> Weather {
+    pub fn start(on: bool, city: String, wake: impl Fn() + Send + 'static) -> Weather {
         let shared: Shared = Arc::default();
         let (tx, rx) = channel();
         let s = shared.clone();
-        let _ = std::thread::Builder::new().name("weather".into()).spawn(move || run(on, &s, &rx, &wake));
+        let _ = std::thread::Builder::new().name("weather".into()).spawn(move || run(on, city, &s, &rx, &wake));
         Weather { shared, seen: 0, tx }
     }
 
     /// 打开 / 关闭天气；关闭后不再联网，状态回到 Unknown。
     pub fn set_enabled(&self, on: bool) {
-        let _ = self.tx.send(on);
+        let _ = self.tx.send(Msg::Enabled(on));
+    }
+
+    /// 系统定位用不了时按这个城市查；空字符串表示不设。改了马上重新查。
+    pub fn set_city(&self, city: String) {
+        let _ = self.tx.send(Msg::City(city));
     }
 
     /// 有变化时返回最新状态。
@@ -70,7 +83,7 @@ impl Weather {
     }
 }
 
-fn run(mut on: bool, shared: &Shared, rx: &Receiver<bool>, wake: &dyn Fn()) {
+fn run(mut on: bool, mut city: String, shared: &Shared, rx: &Receiver<Msg>, wake: &dyn Fn()) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
@@ -86,27 +99,40 @@ fn run(mut on: bool, shared: &Shared, rx: &Receiver<bool>, wake: &dyn Fn()) {
     };
     loop {
         let wait = if on {
-            let st = fetch();
-            // 网络失败时保留上次的结果，过一会儿再试
-            let retry = st == State::Unknown;
-            if !retry {
+            let st = fetch(&city);
+            // 网络失败时保留上次的结果，过一会儿再试；没有位置时也常看看（用户可能刚打开定位）
+            let secs = match st {
+                State::Unknown => 120,
+                State::NoLocation => 60,
+                State::Ready(_) => 30 * 60,
+            };
+            if st != State::Unknown {
                 publish(st);
             }
-            Duration::from_secs(if retry { 120 } else { 30 * 60 })
+            Duration::from_secs(secs)
         } else {
             publish(State::Unknown);
             Duration::from_secs(24 * 3600)
         };
         match rx.recv_timeout(wait) {
-            Ok(v) => on = v,
+            Ok(Msg::Enabled(v)) => on = v,
+            Ok(Msg::City(c)) => city = c,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
 
-fn fetch() -> State {
-    let Some((lat, lon)) = locate() else { return State::NoLocation };
+fn fetch(city: &str) -> State {
+    let city = city.trim();
+    let Some((lat, lon)) = locate() else {
+        if city.is_empty() {
+            return State::NoLocation;
+        }
+        let url = format!("https://wttr.in/{}?format=j1", lyrics::encode(city));
+        let now = lyrics::get(&url, None).ok().and_then(|t| parse_wttr(&t, local_minutes()));
+        return now.map(|n| State::Ready(Now { city: Some(city.to_string()), ..n })).unwrap_or_default();
+    };
     let wttr = format!("https://wttr.in/{lat:.1},{lon:.1}?format=j1");
     let meteo = format!(
         "https://api.open-meteo.com/v1/forecast?latitude={lat:.1}&longitude={lon:.1}\
@@ -154,7 +180,7 @@ fn parse_wttr(text: &str, now_min: u32) -> Option<Now> {
         (Some(rise), Some(set)) => (rise..set).contains(&now_min),
         _ => (6 * 60..18 * 60).contains(&now_min),
     };
-    Some(Now { temp: num(&cur, h!("temp_C"))?, hi: num(&day, h!("maxtempC"))?, lo: num(&day, h!("mintempC"))?, desc, icon, is_day })
+    Some(Now { temp: num(&cur, h!("temp_C"))?, hi: num(&day, h!("maxtempC"))?, lo: num(&day, h!("mintempC"))?, desc, icon, is_day, city: None })
 }
 
 /// "07:02 AM" → 422
@@ -183,6 +209,7 @@ fn parse_open_meteo(text: &str) -> Option<Now> {
         desc,
         icon,
         is_day: cur.GetNamedNumber(h!("is_day")).unwrap_or(1.0) != 0.0,
+        city: None,
     })
 }
 
@@ -292,7 +319,8 @@ mod tests {
     #[ignore]
     fn live_weather() {
         unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap() };
-        println!("{:?}", fetch());
+        println!("{:?}", fetch(""));
+        println!("city: {:?}", fetch("上海"));
         // 定位没开时用固定的公开坐标（北京）检查两个接口
         let t = lyrics::get("https://wttr.in/39.9,116.4?format=j1", None).unwrap();
         println!("wttr: {:?}", parse_wttr(&t, local_minutes()));

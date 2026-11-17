@@ -20,13 +20,15 @@ pub struct Settings {
     pub slim_idle: bool,
     /// 仪表盘显示天气（会把大概位置发给 Open-Meteo）。
     pub weather: bool,
+    /// 系统定位用不了时按这个城市查天气；空 = 没设。
+    pub weather_city: String,
     /// 显示在哪个显示器（设备名，如 \\.\DISPLAY2）；空 = 主显示器。
     pub monitor: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { lyrics: true, level_osd: true, hide_in_fullscreen: true, slim_idle: false, weather: true, monitor: String::new() }
+        Settings { lyrics: true, level_osd: true, hide_in_fullscreen: true, slim_idle: false, weather: true, weather_city: String::new(), monitor: String::new() }
     }
 }
 
@@ -48,6 +50,7 @@ impl Settings {
                 "hide_in_fullscreen" => s.hide_in_fullscreen = b,
                 "slim_idle" => s.slim_idle = b,
                 "weather" => s.weather = b,
+                "weather_city" => s.weather_city = v.to_string(),
                 "monitor" => s.monitor = v.to_string(),
                 _ => {}
             }
@@ -58,12 +61,13 @@ impl Settings {
     pub fn serialize(&self) -> String {
         let b = |v: bool| if v { 1 } else { 0 };
         format!(
-            "lyrics={}\nlevel_osd={}\nhide_in_fullscreen={}\nslim_idle={}\nweather={}\nmonitor={}\n",
+            "lyrics={}\nlevel_osd={}\nhide_in_fullscreen={}\nslim_idle={}\nweather={}\nweather_city={}\nmonitor={}\n",
             b(self.lyrics),
             b(self.level_osd),
             b(self.hide_in_fullscreen),
             b(self.slim_idle),
             b(self.weather),
+            self.weather_city,
             self.monitor
         )
     }
@@ -120,6 +124,7 @@ mod tests {
             hide_in_fullscreen: false,
             slim_idle: true,
             weather: false,
+            weather_city: "上海".into(),
             monitor: "\\\\.\\DISPLAY2".into(),
         };
         assert_eq!(Settings::parse(&s.serialize()), s);

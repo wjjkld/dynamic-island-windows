@@ -29,6 +29,8 @@ const LYRIC_ROW: f32 = 28.0;
 const LYRIC_ROW2: f32 = 46.0;
 /// 便签页每条的行高。
 const NOTE_ROW: f32 = 28.0;
+/// 便签页一次显示几条，多了用滚轮翻。
+const NOTE_ROWS: usize = 5;
 /// 展开态的宽度。
 const EXPANDED_W: f32 = 400.0;
 /// 有两个播放器时，右边小圆泡和岛之间的空隙；岛最宽多少（给小圆泡留位置）。
@@ -245,7 +247,14 @@ enum Btn {
     NewNote,
     CopyNote(usize),
     DelNote(usize),
-    LocationSettings,
+    SetCity,
+}
+
+/// 岛上弹出的输入框是用来输入什么的。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Input {
+    Note,
+    City,
 }
 
 /// 暂存区里一个文件的格子。
@@ -343,8 +352,10 @@ pub struct Island {
     pub weather: weather::State,
     pub notes: Notes,
     /// 正在新建便签（输入框是主循环开的独立小窗口，盖在第一行上）。
-    editing: bool,
-    note_request: bool,
+    editing: Option<Input>,
+    input_request: Option<Input>,
+    /// 便签页从第几条开始显示。
+    note_scroll: usize,
     /// 刚复制的便签：(第几条, 时刻)，显示「已复制」。
     copied: Option<(usize, Instant)>,
 
@@ -418,8 +429,9 @@ impl Island {
             device: (String::new(), String::new(), None),
             weather: weather::State::Unknown,
             notes,
-            editing: false,
-            note_request: false,
+            editing: None,
+            input_request: None,
+            note_scroll: 0,
             copied: None,
             shelf,
             icons: HashMap::new(),
@@ -546,11 +558,12 @@ impl Island {
                 self.pressed = false;
                 self.press.target = 1.0;
             }
-            if self.expanded && !self.pin && !self.editing {
+            if self.expanded && !self.pin && self.editing.is_none() {
                 let since = *self.leave_since.get_or_insert(now);
                 if now - since >= LEAVE_DELAY {
                     self.expanded = false;
                     self.page = Page::Media;
+                    self.note_scroll = 0;
                     self.leave_since = None;
                 }
             }
@@ -619,9 +632,24 @@ impl Island {
         }
     }
 
-    /// 滚轮翻页：往下滚到下一页，往上滚到上一页。
+    /// 滚轮翻页：往下滚到下一页，往上滚到上一页。便签多的时候先滚便签，滚到头再翻页。
     pub fn wheel(&mut self, delta: i32) {
-        if !self.expanded || self.editing || self.page_changed.elapsed() < PAGE_DEBOUNCE {
+        if !self.expanded || self.editing.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if self.page == Page::Notes {
+            let max = self.notes.items.len().saturating_sub(NOTE_ROWS);
+            let next = if delta < 0 { (self.note_scroll + 1).min(max) } else { self.note_scroll.saturating_sub(1) };
+            if next != self.note_scroll {
+                self.note_scroll = next;
+                // 滚完停一下才会翻页，免得一路滚过头
+                self.page_changed = now;
+                self.dirty = true;
+                return;
+            }
+        }
+        if now - self.page_changed < PAGE_DEBOUNCE {
             return;
         }
         let pages = self.pages();
@@ -724,12 +752,8 @@ impl Island {
                 self.page_changed = Instant::now();
             }
             Btn::Swap => self.media.send(Cmd::Swap),
-            Btn::NewNote => {
-                if !self.notes.is_full() && !self.editing {
-                    self.editing = true;
-                    self.note_request = true;
-                }
-            }
+            Btn::NewNote => self.request_input(Input::Note),
+            Btn::SetCity => self.request_input(Input::City),
             Btn::CopyNote(i) => {
                 if let Some(t) = self.notes.items.get(i)
                     && notes::copy(t)
@@ -739,9 +763,9 @@ impl Island {
             }
             Btn::DelNote(i) => {
                 self.notes.remove(i);
+                self.note_scroll = self.note_scroll.min(self.notes.items.len().saturating_sub(NOTE_ROWS));
                 self.copied = None;
             }
-            Btn::LocationSettings => open_url("ms-settings:privacy-location"),
         }
         self.dirty = true;
     }
@@ -825,14 +849,16 @@ impl Island {
             }
             "slim" => self.slim = true,
             "notes" => {
-                self.notes.items = vec!["周五前把报销单交了".into(), "灵动岛：试试把天气放到细条上".into(), "买咖啡豆".into()];
+                self.notes.items = ["周五前把报销单交了", "灵动岛：试试把天气放到细条上", "买咖啡豆", "周末看《沙丘》", "给妈妈打电话", "整理照片", "续费域名"]
+                    .map(String::from)
+                    .to_vec();
                 self.page = Page::Notes;
                 self.expanded = true;
                 self.pin = true;
                 self.cursor = (230.0, 8.0 + 50.0 + NOTE_ROW * 1.5);
             }
             "weather" => {
-                self.weather = weather::State::Ready(weather::Now { temp: 17.4, hi: 20.0, lo: 11.0, desc: "多云", icon: Icon::PartlyCloudy, is_day: true });
+                self.weather = weather::State::Ready(weather::Now { temp: 17.4, hi: 20.0, lo: 11.0, desc: "多云", icon: Icon::PartlyCloudy, is_day: true, city: Some("上海".into()) });
                 self.page = Page::Dash;
                 self.expanded = true;
                 self.pin = true;
@@ -861,21 +887,31 @@ impl Island {
         self.show_toast(Toast::Device);
     }
 
-    /// 点了「+」要新建便签时返回输入框的位置（窗口内逻辑坐标），只返回一次。
-    pub fn take_note_request(&mut self) -> Option<Rect> {
-        if !std::mem::take(&mut self.note_request) {
-            return None;
+    fn request_input(&mut self, kind: Input) {
+        if self.editing.is_none() {
+            self.editing = Some(kind);
+            self.input_request = Some(kind);
+            self.note_scroll = 0;
         }
-        // 展开态总是宽 EXPANDED_W、贴着 TOP；输入框占第一行
-        let r = Rect::new((WIN_W - EXPANDED_W) / 2.0, TOP, EXPANDED_W, 0.0);
-        Some(note_row(r, 0).inflate(-2.0))
     }
 
-    /// 输入结束：text 为 None 表示取消。
-    pub fn end_note(&mut self, text: Option<String>) {
-        self.editing = false;
-        if let Some(t) = text {
-            self.notes.add(&t);
+    /// 要弹输入框时返回 (用途, 位置：窗口内逻辑坐标)，只返回一次。
+    pub fn take_input_request(&mut self) -> Option<(Input, Rect)> {
+        let kind = self.input_request.take()?;
+        // 展开态总是宽 EXPANDED_W、贴着 TOP
+        let r = Rect::new((WIN_W - EXPANDED_W) / 2.0, TOP, EXPANDED_W, 0.0);
+        let at = match kind {
+            Input::Note => note_row(r, 0).inflate(-2.0),
+            Input::City => city_field(r),
+        };
+        Some((kind, at))
+    }
+
+    /// 输入结束：text 为 None 表示取消。城市由主循环存进设置，这里只管便签。
+    pub fn end_input(&mut self, kind: Input, text: Option<&str>) {
+        self.editing = None;
+        if let (Input::Note, Some(t)) = (kind, text) {
+            self.notes.add(t);
         }
         self.copied = None;
         self.dirty = true;
@@ -944,7 +980,7 @@ impl Island {
             media_visible,
             files: !self.shelf.items.is_empty(),
             page: self.page,
-            notes: (self.notes.items.len() + self.editing as usize) as u8,
+            notes: (self.notes.items.len() + (self.editing == Some(Input::Note)) as usize).min(NOTE_ROWS) as u8,
             lyrics: match &self.info.lyrics {
                 None => 0,
                 Some(l) if l.lines.iter().any(|x| x.trans.is_some()) => 2,
@@ -1547,21 +1583,34 @@ impl Island {
         g.text(&clock.time, &g.fonts.clock, Rect::new(r.x + pad, r.y + 14.0, 160.0, 46.0), with_alpha(WHITE, a));
         g.text(&clock.date, &g.fonts.body, Rect::new(r.x + pad + 2.0, r.y + 58.0, 200.0, 22.0), with_alpha(WHITE, 0.55 * a));
         let right = r.x + r.w - pad;
-        match &self.weather {
-            weather::State::Ready(n) => {
-                let (desc, icon) = (n.desc, n.icon);
-                let temp = format!("{}°", n.temp.round() as i32);
-                g.text(&temp, &g.fonts.title_right, Rect::new(right - 60.0, r.y + 18.0, 60.0, 24.0), with_alpha(WHITE, a));
-                draw_weather_icon(g, right - 52.0, r.y + 30.0, icon, n.is_day, a);
-                let line = format!("{desc}  {}° / {}°", n.lo.round() as i32, n.hi.round() as i32);
-                g.text(&line, &g.fonts.small_right, Rect::new(right - 180.0, r.y + 42.0, 180.0, 18.0), with_alpha(WHITE, 0.55 * a));
+        let field = city_field(r);
+        if self.editing == Some(Input::City) {
+            // 输入框（独立小窗口）盖在这里，画个底
+            g.fill_rrect(field, 8.0, with_alpha(rgba(0.17, 0.17, 0.18, 1.0), a));
+        } else {
+            match &self.weather {
+                weather::State::Ready(n) => {
+                    let (desc, icon) = (n.desc, n.icon);
+                    let temp = format!("{}°", n.temp.round() as i32);
+                    g.text(&temp, &g.fonts.title_right, Rect::new(right - 60.0, r.y + 18.0, 60.0, 24.0), with_alpha(WHITE, a));
+                    draw_weather_icon(g, right - 52.0, r.y + 30.0, icon, n.is_day, a);
+                    let line = match &n.city {
+                        Some(c) => format!("{c} · {desc}  {}° / {}°", n.lo.round() as i32, n.hi.round() as i32),
+                        None => format!("{desc}  {}° / {}°", n.lo.round() as i32, n.hi.round() as i32),
+                    };
+                    g.text(&line, &g.fonts.small_right, Rect::new(right - 200.0, r.y + 42.0, 200.0, 18.0), with_alpha(WHITE, 0.55 * a));
+                    // 按手动城市查的：点天气可以改城市
+                    if n.city.is_some() {
+                        self.buttons.push((Btn::SetCity, Rect::new(right - 200.0, r.y + 16.0, 200.0, 46.0)));
+                    }
+                }
+                weather::State::NoLocation => {
+                    let hint = Rect::new(right - 190.0, r.y + 22.0, 190.0, 18.0);
+                    g.text("定位不可用，点这里设置城市 ›", &g.fonts.small_right, hint, with_alpha(WHITE, 0.4 * a));
+                    self.buttons.push((Btn::SetCity, hint.inflate(4.0)));
+                }
+                weather::State::Unknown => {}
             }
-            weather::State::NoLocation => {
-                let hint = Rect::new(right - 150.0, r.y + 22.0, 150.0, 18.0);
-                g.text("开启定位以显示天气 ›", &g.fonts.small_right, hint, with_alpha(WHITE, 0.4 * a));
-                self.buttons.push((Btn::LocationSettings, hint.inflate(4.0)));
-            }
-            weather::State::Unknown => {}
         }
         if let Some(b) = self.battery {
             let bx = right - 26.0;
@@ -1617,11 +1666,14 @@ impl Island {
     /// 便签页：标题和「+」，下面每行一条；悬停显示删除，点一下复制。
     fn draw_notes(&mut self, g: &Renderer, r: Rect, a: f32) {
         let pad = 24.0;
-        g.text("便签", &g.fonts.title, Rect::new(r.x + pad, r.y + 16.0, 120.0, 24.0), with_alpha(WHITE, a));
+        let editing = self.editing == Some(Input::Note);
+        g.text("便签", &g.fonts.title, Rect::new(r.x + pad, r.y + 16.0, 40.0, 24.0), with_alpha(WHITE, a));
+        let total = self.notes.items.len();
+        if total > 0 {
+            g.text(&format!("{total} 条"), &g.fonts.small, Rect::new(r.x + pad + 40.0, r.y + 17.0, 80.0, 24.0), with_alpha(WHITE, 0.35 * a));
+        }
         let add = Rect::new(r.x + r.w - pad - 26.0, r.y + 15.0, 26.0, 26.0);
-        if self.notes.is_full() {
-            g.text(&format!("最多 {} 条", notes::MAX), &g.fonts.small_right, Rect::new(add.x + add.w - 120.0, add.y, 120.0, add.h), with_alpha(WHITE, 0.4 * a));
-        } else if !self.editing {
+        if !editing {
             let hot = add.inflate(4.0).contains(self.cursor.0, self.cursor.1);
             g.fill_rrect(add, 13.0, with_alpha(WHITE, if hot { 0.22 } else { 0.12 } * a));
             let (cx, cy) = (add.x + 13.0, add.y + 13.0);
@@ -1630,21 +1682,32 @@ impl Island {
             self.buttons.push((Btn::NewNote, add.inflate(5.0)));
         }
 
-        let first = if self.editing {
+        let first = if editing {
             // 输入框（独立小窗口）就盖在这一行上，这里画个底
             g.fill_rrect(note_row(r, 0).inflate(-2.0), 8.0, with_alpha(rgba(0.17, 0.17, 0.18, 1.0), a));
             1
         } else {
             0
         };
-        if self.notes.items.is_empty() && !self.editing {
+        if total == 0 && !editing {
             g.text("点右上角的 + 记下一个想法", &g.fonts.small_center, Rect::new(r.x, r.y + 80.0, r.w, 22.0), with_alpha(WHITE, 0.35 * a));
             return;
         }
-        let items = self.notes.items.clone();
-        for (i, text) in items.iter().enumerate() {
-            let row = note_row(r, first + i);
-            let hover = !self.editing && row.contains(self.cursor.0, self.cursor.1);
+        let slots = NOTE_ROWS - first;
+        let scroll = self.note_scroll.min(total.saturating_sub(slots));
+        if total > slots {
+            // 右边的滚动条
+            let top = note_row(r, 0).y + 2.0;
+            let track_h = NOTE_ROWS as f32 * NOTE_ROW - 6.0;
+            let thumb_h = (track_h * slots as f32 / total as f32).max(16.0);
+            let y = top + (track_h - thumb_h) * scroll as f32 / (total - slots) as f32;
+            g.fill_rrect(Rect::new(r.x + r.w - 10.0, y, 3.0, thumb_h), 1.5, with_alpha(WHITE, 0.3 * a));
+        }
+        let items: Vec<(usize, String)> = self.notes.items.iter().cloned().enumerate().skip(scroll).take(slots).collect();
+        for (k, (i, text)) in items.iter().enumerate() {
+            let i = *i;
+            let row = note_row(r, first + k);
+            let hover = !editing && row.contains(self.cursor.0, self.cursor.1);
             if hover {
                 g.fill_rrect(row, 8.0, with_alpha(WHITE, 0.07 * a));
             }
@@ -1663,11 +1726,16 @@ impl Island {
                 g.line((cx - 3.5, ccy + 3.5), (cx + 3.5, ccy - 3.5), 1.6, c);
                 self.buttons.push((Btn::DelNote(i), close.inflate(4.0)));
             }
-            if !self.editing {
+            if !editing {
                 self.buttons.push((Btn::CopyNote(i), row));
             }
         }
     }
+}
+
+/// 仪表盘右上角天气的位置（也是输入城市时输入框的位置）。
+fn city_field(r: Rect) -> Rect {
+    Rect::new(r.x + r.w - 24.0 - 190.0, r.y + 18.0, 190.0, 28.0)
 }
 
 /// 便签页第 i 行的位置。
@@ -1726,16 +1794,6 @@ fn draw_weather_icon(g: &Renderer, cx: f32, cy: f32, icon: Icon, day: bool, a: f
                 g.fill_poly(&[(cx + 1.0, cy + 4.0), (cx - 3.0, cy + 9.0), (cx, cy + 9.0), (cx - 1.5, cy + 13.0), (cx + 4.0, cy + 7.5), (cx + 1.0, cy + 7.5), (cx + 3.0, cy + 4.0)], sun);
             }
         }
-    }
-}
-
-/// 用系统默认方式打开（设置页、网址）。
-fn open_url(url: &str) {
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use windows::core::{HSTRING, w};
-    unsafe {
-        ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
     }
 }
 
@@ -1841,7 +1899,7 @@ mod tests {
             Layout::ExpandedDash { shelf: false },
             Layout::ExpandedDash { shelf: true },
             Layout::ExpandedNotes { shelf: false, rows: 0 },
-            Layout::ExpandedNotes { shelf: true, rows: notes::MAX as u8 },
+            Layout::ExpandedNotes { shelf: true, rows: NOTE_ROWS as u8 },
         ];
         for l in all {
             let (w, h, r) = l.dims();

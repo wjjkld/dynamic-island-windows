@@ -1,5 +1,5 @@
 //! 便签：随手记下的想法，每条一行，存在 %APPDATA%\WinDynamicIsland\notes.txt。
-//! 新的在最上面；最多 MAX 条，满了要先删掉旧的。
+//! 新的在最上面，条数不限（岛上一次显示几条，滚轮翻）。
 
 use std::path::PathBuf;
 
@@ -8,9 +8,8 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenC
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
-pub const MAX: usize = 5;
-/// 一条便签最多多少个字。
-pub const MAX_CHARS: usize = 60;
+/// 一条便签最多多少个字（岛上一行放不下时显示省略号，复制出来是完整的）。
+pub const MAX_CHARS: usize = 200;
 
 #[derive(Default)]
 pub struct Notes {
@@ -25,14 +24,10 @@ impl Notes {
         Notes { items: parse(&text), path }
     }
 
-    pub fn is_full(&self) -> bool {
-        self.items.len() >= MAX
-    }
-
-    /// 加一条（放最上面）。空白或已满时不加，返回是否加了。
+    /// 加一条（放最上面）。空白时不加，返回是否加了。
     pub fn add(&mut self, text: &str) -> bool {
         let t = clean(text);
-        if t.is_empty() || self.is_full() {
+        if t.is_empty() {
             return false;
         }
         self.items.insert(0, t);
@@ -61,7 +56,7 @@ fn path() -> Option<PathBuf> {
 }
 
 fn parse(text: &str) -> Vec<String> {
-    text.lines().map(clean).filter(|l| !l.is_empty()).take(MAX).collect()
+    text.lines().map(clean).filter(|l| !l.is_empty()).collect()
 }
 
 /// 去掉首尾空白和换行，截到 MAX_CHARS 个字。
@@ -108,8 +103,8 @@ mod tests {
     fn parse_and_clean() {
         assert_eq!(parse("  a  \n\n b\r\n"), ["a", "b"]);
         assert_eq!(clean("第一行\n第二行"), "第一行 第二行");
-        assert_eq!(clean(&"字".repeat(100)).chars().count(), MAX_CHARS);
-        assert_eq!(parse(&"x\n".repeat(9)).len(), MAX);
+        assert_eq!(clean(&"字".repeat(300)).chars().count(), MAX_CHARS);
+        assert_eq!(parse(&"x\n".repeat(30)).len(), 30);
     }
 
     #[test]
@@ -121,9 +116,9 @@ mod tests {
         assert_eq!(n.items, ["回邮件", "买牛奶"]);
         n.remove(0);
         assert_eq!(n.items, ["买牛奶"]);
-        for i in 0..10 {
+        for i in 0..20 {
             n.add(&i.to_string());
         }
-        assert!(n.is_full() && n.items.len() == MAX);
+        assert_eq!(n.items.len(), 21);
     }
 }
