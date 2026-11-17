@@ -1,0 +1,6 @@
+# 把 C 运行库静态链接进 exe，别人电脑上没装 VC++ 运行库（VCRUNTIME140.dll）也能直接运行。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

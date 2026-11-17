@@ -2,7 +2,12 @@
 name = "island"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "轻量的 Windows 灵动岛"
+license = "MIT"
+readme = "README.md"
+keywords = ["windows", "dynamic-island", "smtc", "direct2d"]
+categories = ["gui"]
 
 [dependencies]
 windows-core = "0.62.2"
