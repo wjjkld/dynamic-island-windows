@@ -1,9 +1,11 @@
 //! 系统状态：电池、全屏检测、本地时间。
 
-use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MONITORINFOEXW, MonitorFromPoint, MonitorFromWindow,
 };
+use windows::core::BOOL;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::{QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN, SHQueryUserNotificationState};
@@ -33,8 +35,8 @@ pub fn battery() -> Option<Battery> {
 
 /// 有全屏应用（游戏、全屏视频、演示）时让位。
 /// SHQueryUserNotificationState 的 QUNS_BUSY 误报很多，只信独占全屏和演示模式，
-/// 其余情况自己判断：前台窗口是否盖满主显示器。
-pub fn fullscreen_app_running() -> bool {
+/// 其余情况自己判断：前台窗口是否盖满岛所在的显示器。
+pub fn fullscreen_app_running(on: HMONITOR) -> bool {
     if let Ok(s) = unsafe { SHQueryUserNotificationState() }
         && (s == QUNS_RUNNING_D3D_FULL_SCREEN || s == QUNS_PRESENTATION_MODE) {
             return true;
@@ -55,7 +57,7 @@ pub fn fullscreen_app_running() -> bool {
             return false;
         }
         let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-        if mon != MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) {
+        if mon != on {
             return false;
         }
         let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -71,6 +73,48 @@ const IGNORED_CLASSES: [&str; 5] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shel
 
 fn covers(win: &RECT, mon: &RECT) -> bool {
     win.left <= mon.left && win.top <= mon.top && win.right >= mon.right && win.bottom >= mon.bottom
+}
+
+pub struct Monitor {
+    pub handle: HMONITOR,
+    /// 设备名，如 `\\.\DISPLAY2`，用来在设置里记住选择。
+    pub name: String,
+    pub rect: RECT,
+    pub primary: bool,
+}
+
+pub fn monitors() -> Vec<Monitor> {
+    unsafe extern "system" fn each(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        let list = unsafe { &mut *(data.0 as *mut Vec<Monitor>) };
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(h, &mut mi as *mut _ as *mut MONITORINFO) }.as_bool() {
+            let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+            list.push(Monitor {
+                handle: h,
+                name: String::from_utf16_lossy(&mi.szDevice[..n]),
+                rect: mi.monitorInfo.rcMonitor,
+                primary: mi.monitorInfo.dwFlags & 1 != 0,
+            });
+        }
+        true.into()
+    }
+    let mut list: Vec<Monitor> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut list as *mut _ as isize));
+    }
+    list.sort_by_key(|m| (m.rect.left, m.rect.top));
+    list
+}
+
+/// 按设备名找显示器，找不到（拔掉了）或没指定时用主显示器。
+pub fn monitor_named(name: &str) -> HMONITOR {
+    if !name.is_empty()
+        && let Some(m) = monitors().into_iter().find(|m| m.name == name)
+    {
+        return m.handle;
+    }
+    unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) }
 }
 
 pub struct Clock {

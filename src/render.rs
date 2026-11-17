@@ -47,6 +47,8 @@ pub struct Fonts {
     pub title: IDWriteTextFormat,
     pub title_center: IDWriteTextFormat,
     pub tiny_center: IDWriteTextFormat,
+    pub small_center: IDWriteTextFormat,
+    pub lyric_center: IDWriteTextFormat,
     pub body: IDWriteTextFormat,
     pub small: IDWriteTextFormat,
     pub small_right: IDWriteTextFormat,
@@ -62,6 +64,7 @@ pub struct Renderer {
     _target: IDCompositionTarget,
     _visual: IDCompositionVisual,
     brush: ID2D1SolidColorBrush,
+    round: ID2D1StrokeStyle,
     pub fonts: Fonts,
     dpi: f32,
 }
@@ -106,8 +109,21 @@ impl Renderer {
 
             let brush = dc.CreateSolidColorBrush(&color(rgba(1.0, 1.0, 1.0, 1.0)), None)?;
             let fonts = create_fonts()?;
+            let base: &ID2D1Factory = &factory;
+            let round = base.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 10.0,
+                    dashStyle: D2D1_DASH_STYLE_SOLID,
+                    dashOffset: 0.0,
+                },
+                None,
+            )?;
 
-            let r = Renderer { _d3d: d3d, factory, dc, swap, dcomp, _target: target, _visual: visual, brush, fonts, dpi };
+            let r = Renderer { _d3d: d3d, factory, dc, swap, dcomp, _target: target, _visual: visual, brush, round, fonts, dpi };
             r.bind_target()?;
             Ok(r)
         }
@@ -183,7 +199,38 @@ impl Renderer {
     }
 
     pub fn line(&self, a: (f32, f32), b: (f32, f32), width: f32, c: Color) {
-        unsafe { self.dc.DrawLine(pt(a), pt(b), self.with_color(c), width, None) }
+        unsafe { self.dc.DrawLine(pt(a), pt(b), self.with_color(c), width, &self.round) }
+    }
+
+    /// 圆弧（从 12 点方向顺时针，frac = 0..1 占整圈的比例），圆头。
+    pub fn arc(&self, cx: f32, cy: f32, r: f32, frac: f32, width: f32, c: Color) {
+        let frac = frac.clamp(0.0, 1.0);
+        if frac <= 0.001 {
+            return;
+        }
+        if frac >= 0.999 {
+            let e = D2D1_ELLIPSE { point: pt((cx, cy)), radiusX: r, radiusY: r };
+            unsafe { self.dc.DrawEllipse(&e, self.with_color(c), width, &self.round) };
+            return;
+        }
+        let a = frac * std::f32::consts::TAU;
+        let end = (cx + r * a.sin(), cy - r * a.cos());
+        unsafe {
+            let Ok(geo) = self.factory.CreatePathGeometry() else { return };
+            let Ok(sink) = geo.Open() else { return };
+            sink.BeginFigure(pt((cx, cy - r)), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: pt(end),
+                size: D2D_SIZE_F { width: r, height: r },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: if frac > 0.5 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            if sink.Close().is_ok() {
+                self.dc.DrawGeometry(&geo, self.with_color(c), width, &self.round);
+            }
+        }
     }
 
     pub fn fill_poly(&self, pts: &[(f32, f32)], c: Color) {
@@ -276,6 +323,8 @@ fn create_fonts() -> Result<Fonts> {
             title: make(15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             title_center: make(15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             tiny_center: make(11.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+            small_center: make(12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+            lyric_center: make(13.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             body: make(13.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             small: make(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             small_right: make(11.5, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING)?,

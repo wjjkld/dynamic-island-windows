@@ -17,6 +17,8 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, Co
 use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
 use windows::core::{Result, RuntimeType};
 
+use crate::lyrics::{self, Lyrics};
+
 /// 封面解码后的边长（像素，BGRA 预乘）。
 pub const ART: u32 = 128;
 
@@ -30,6 +32,12 @@ pub struct MediaInfo {
     pub position: f64,
     pub sampled_at: Option<Instant>,
     pub duration: f64,
+    /// 时间轴起点（秒）。跳转时要加回去。
+    pub start: f64,
+    /// 播放器是否支持跳转进度。
+    pub can_seek: bool,
+    /// 当前歌曲的歌词（查到才有）。
+    pub lyrics: Option<Arc<Lyrics>>,
     /// 每换一首歌 +1。
     pub track_id: u64,
     pub art: Option<Arc<Vec<u8>>>,
@@ -54,6 +62,10 @@ pub enum Cmd {
     Toggle,
     Next,
     Prev,
+    /// 跳到第几秒（相对歌曲开头）。
+    Seek(f64),
+    /// 打开/关闭歌词查询。
+    Lyrics(bool),
     /// 内部用：系统事件通知需要刷新。
     Refresh,
 }
@@ -64,19 +76,28 @@ pub struct Media {
 }
 
 impl Media {
-    pub fn start(wake: impl Fn() + Send + 'static) -> Media {
+    pub fn start(wake: impl Fn() + Send + Sync + 'static, lyrics_on: bool) -> Media {
         let info = Arc::new(Mutex::new(MediaInfo { accent: DEFAULT_ACCENT, ..Default::default() }));
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let (tx, rx) = mpsc::channel();
+        let (ltx, lrx) = mpsc::channel::<LyricReq>();
         let shared = info.clone();
         let event_tx = tx.clone();
+        let w = wake.clone();
         std::thread::Builder::new()
             .name("media".into())
             .spawn(move || {
-                if let Err(e) = run(&shared, &rx, &event_tx, &wake) {
+                let ctx = Ctx { info: &shared, rx: &rx, tx: &event_tx, lyrics: &ltx, wake: &*w, lyrics_on };
+                if let Err(e) = run(ctx) {
                     eprintln!("[media] 线程退出: {e:?}");
                 }
             })
             .expect("spawn media thread");
+        let shared = info.clone();
+        std::thread::Builder::new()
+            .name("lyrics".into())
+            .spawn(move || lyrics_worker(&shared, &lrx, &*wake))
+            .expect("spawn lyrics thread");
         Media { info, tx }
     }
 
@@ -91,6 +112,48 @@ impl Media {
 }
 
 const DEFAULT_ACCENT: [f32; 3] = [0.92, 0.92, 0.95];
+
+struct LyricReq {
+    track_id: u64,
+    title: String,
+    artist: String,
+    duration: f64,
+}
+
+/// 歌词在单独线程查（网络可能慢），只处理最新的一首。
+fn lyrics_worker(info: &Mutex<MediaInfo>, rx: &Receiver<LyricReq>, wake: &(dyn Fn() + Send + Sync)) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    while let Ok(mut req) = rx.recv() {
+        while let Ok(r) = rx.try_recv() {
+            req = r;
+        }
+        let found = lyrics::find(&lyrics::Query { title: &req.title, artist: &req.artist, duration: req.duration });
+        let mut g = info.lock().unwrap();
+        if g.track_id == req.track_id {
+            g.lyrics = found.map(Arc::new);
+            g.version += 1;
+            drop(g);
+            wake();
+        }
+    }
+}
+
+struct Ctx<'a> {
+    info: &'a Mutex<MediaInfo>,
+    rx: &'a Receiver<Cmd>,
+    tx: &'a Sender<Cmd>,
+    lyrics: &'a Sender<LyricReq>,
+    wake: &'a (dyn Fn() + Send + Sync),
+    lyrics_on: bool,
+}
+
+fn request_lyrics(c: &Ctx, g: &MediaInfo) {
+    if c.lyrics_on && g.active && !g.title.is_empty() {
+        let _ = c.lyrics.send(LyricReq { track_id: g.track_id, title: g.title.clone(), artist: g.artist.clone(), duration: g.duration });
+    }
+}
 
 /// 生成一个只负责"通知媒体线程去刷新"的 WinRT 事件回调。
 fn notifier<S: RuntimeType + 'static, A: RuntimeType + 'static>(tx: &Sender<Cmd>) -> TypedEventHandler<S, A> {
@@ -123,7 +186,8 @@ impl Drop for Subscription {
     }
 }
 
-fn run(info: &Mutex<MediaInfo>, rx: &Receiver<Cmd>, tx: &Sender<Cmd>, wake: &dyn Fn()) -> Result<()> {
+fn run(mut c: Ctx) -> Result<()> {
+    let (info, rx, tx) = (c.info, c.rx, c.tx);
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let mgr = Manager::RequestAsync()?.join()?;
     let wic: IWICImagingFactory = unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
@@ -140,18 +204,36 @@ fn run(info: &Mutex<MediaInfo>, rx: &Receiver<Cmd>, tx: &Sender<Cmd>, wake: &dyn
         let fallback = Duration::from_secs(if playing { 3 } else { 10 });
         match rx.recv_timeout(fallback) {
             Ok(Cmd::Refresh) => {
+                #[cfg(debug_assertions)]
+                if std::env::var_os("ISLAND_TRACE").is_some() {
+                    eprintln!("[media] refresh {:?}", std::time::SystemTime::now());
+                }
                 // 一次变化常常连发好几个事件，攒一下再查
                 std::thread::sleep(Duration::from_millis(60));
                 while rx.try_recv().is_ok() {}
                 resubscribe = true;
             }
+            Ok(Cmd::Lyrics(on)) => {
+                c.lyrics_on = on;
+                let mut g = info.lock().unwrap();
+                if on {
+                    request_lyrics(&c, &g);
+                } else if g.lyrics.take().is_some() {
+                    g.version += 1;
+                    drop(g);
+                    (c.wake)();
+                }
+                continue;
+            }
             Ok(cmd) => {
                 if let Ok(s) = mgr.GetCurrentSession() {
+                    let start = info.lock().map(|g| g.start).unwrap_or(0.0);
                     let r = match cmd {
                         Cmd::Toggle => s.TryTogglePlayPauseAsync(),
                         Cmd::Next => s.TrySkipNextAsync(),
                         Cmd::Prev => s.TrySkipPreviousAsync(),
-                        Cmd::Refresh => unreachable!(),
+                        Cmd::Seek(sec) => s.TryChangePlaybackPositionAsync(((start + sec.max(0.0)) * 1e7) as i64),
+                        Cmd::Refresh | Cmd::Lyrics(_) => unreachable!(),
                     };
                     if let Ok(op) = r {
                         let _ = op.join();
@@ -177,7 +259,7 @@ fn run(info: &Mutex<MediaInfo>, rx: &Receiver<Cmd>, tx: &Sender<Cmd>, wake: &dyn
         }
 
         let changed = match current {
-            Some(session) => poll(&session, &wic, info, &mut last_key).unwrap_or(false),
+            Some(session) => poll(&session, &wic, &c, &mut last_key).unwrap_or(false),
             None => {
                 let mut g = info.lock().unwrap();
                 if g.active {
@@ -190,16 +272,19 @@ fn run(info: &Mutex<MediaInfo>, rx: &Receiver<Cmd>, tx: &Sender<Cmd>, wake: &dyn
             }
         };
         if changed {
-            wake();
+            (c.wake)();
         }
     }
 }
 
-fn poll(session: &Session, wic: &IWICImagingFactory, info: &Mutex<MediaInfo>, last_key: &mut String) -> Result<bool> {
+fn poll(session: &Session, wic: &IWICImagingFactory, c: &Ctx, last_key: &mut String) -> Result<bool> {
+    let info = c.info;
     let props = session.TryGetMediaPropertiesAsync()?.join()?;
     let title = props.Title()?.to_string_lossy();
     let artist = props.Artist()?.to_string_lossy();
-    let playing = session.GetPlaybackInfo()?.PlaybackStatus()? == Status::Playing;
+    let pb = session.GetPlaybackInfo()?;
+    let playing = pb.PlaybackStatus()? == Status::Playing;
+    let can_seek = pb.Controls().and_then(|c| c.IsPlaybackPositionEnabled()).unwrap_or(false);
 
     let tl = session.GetTimelineProperties()?;
     let start = tl.StartTime()?.Duration as f64 / 1e7;
@@ -230,7 +315,9 @@ fn poll(session: &Session, wic: &IWICImagingFactory, info: &Mutex<MediaInfo>, la
         }
 
     let mut g = info.lock().unwrap();
-    let before = (g.active, g.playing, g.title.clone(), g.artist.clone(), (g.duration as i64));
+    let before = (g.active, g.playing, g.title.clone(), g.artist.clone(), (g.duration as i64), g.can_seek);
+    g.start = start;
+    g.can_seek = can_seek;
     g.active = !title.is_empty();
     g.title = title;
     g.artist = artist;
@@ -244,8 +331,10 @@ fn poll(session: &Session, wic: &IWICImagingFactory, info: &Mutex<MediaInfo>, la
         g.track_id += 1;
         g.art = art;
         g.accent = accent.unwrap_or(DEFAULT_ACCENT);
+        g.lyrics = None;
+        request_lyrics(c, &g);
     }
-    let after = (g.active, g.playing, g.title.clone(), g.artist.clone(), (g.duration as i64));
+    let after = (g.active, g.playing, g.title.clone(), g.artist.clone(), (g.duration as i64), g.can_seek);
     let changed = new_track || before != after || drift > 1.5;
     if changed {
         g.version += 1;

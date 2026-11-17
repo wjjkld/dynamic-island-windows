@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::media::{ART, Cmd, Media, MediaInfo};
@@ -15,10 +17,12 @@ use crate::system::{self, Battery};
 
 /// 窗口逻辑尺寸：容纳最大展开态 + 回弹余量。
 pub const WIN_W: f32 = 460.0;
-pub const WIN_H: f32 = 270.0;
+pub const WIN_H: f32 = 300.0;
 const TOP: f32 = 8.0;
 /// 展开态底部暂存区那一行的高度。
 const SHELF_ROW: f32 = 92.0;
+/// 展开态媒体页的歌词行高度。
+const LYRIC_ROW: f32 = 28.0;
 const TILE_W: f32 = 68.0;
 const TILE_GAP: f32 = 4.0;
 /// 按住文件拖多远算"拖出去"。
@@ -27,24 +31,31 @@ const DRAG_SLOP: f32 = 5.0;
 const HOVER_DELAY: Duration = Duration::from_millis(140);
 const LEAVE_DELAY: Duration = Duration::from_millis(320);
 const PAUSED_LINGER: Duration = Duration::from_secs(30);
-const TOAST_TIME: Duration = Duration::from_millis(2800);
+const LYRIC_ANIM: f32 = 0.28;
 
 const BLACK: Color = rgba(0.0, 0.0, 0.0, 1.0);
 const WHITE: Color = rgba(1.0, 1.0, 1.0, 1.0);
 const GREEN: Color = rgba(0.29, 0.86, 0.39, 1.0);
 const BLUE: Color = rgba(0.30, 0.62, 1.0, 1.0);
+const ORANGE: Color = rgba(1.0, 0.62, 0.04, 1.0);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// files：暂存区里有文件，药丸上显示个数。
     Idle { files: bool },
-    Media,
+    /// lyric：加宽，中间显示当前歌词。
+    Media { lyric: bool },
     TrackToast,
     Charging,
+    /// 音量 / 亮度条。
+    Level,
+    /// 计时器倒计时（没有音乐时）。
+    Timer,
+    TimerDone,
     /// 正在往岛上拖文件。
     Drop,
-    /// shelf：底部多一行暂存的文件。
-    ExpandedMedia { shelf: bool },
+    /// shelf：底部多一行暂存的文件；lyric：多一行歌词。
+    ExpandedMedia { shelf: bool, lyric: bool },
     ExpandedDash { shelf: bool },
 }
 
@@ -55,27 +66,52 @@ impl Layout {
         match self {
             Layout::Idle { files: false } => (120.0, 30.0, 15.0),
             Layout::Idle { files: true } => (150.0, 30.0, 15.0),
-            Layout::Media => (250.0, 34.0, 17.0),
+            Layout::Media { lyric: false } => (250.0, 34.0, 17.0),
+            Layout::Media { lyric: true } => (420.0, 34.0, 17.0),
             Layout::TrackToast => (360.0, 34.0, 17.0),
             Layout::Charging => (300.0, 34.0, 17.0),
+            Layout::Level => (320.0, 34.0, 17.0),
+            Layout::Timer => (190.0, 34.0, 17.0),
+            Layout::TimerDone => (300.0, 34.0, 17.0),
             Layout::Drop => (400.0, 120.0, 40.0),
-            Layout::ExpandedMedia { shelf } => (400.0, 150.0 + row(shelf), 40.0),
-            Layout::ExpandedDash { shelf: false } => (340.0, 108.0, 36.0),
-            Layout::ExpandedDash { shelf: true } => (400.0, 108.0 + SHELF_ROW, 36.0),
+            Layout::ExpandedMedia { shelf, .. } => (400.0, self.base_height() + row(shelf), 40.0),
+            Layout::ExpandedDash { shelf } => (400.0, self.base_height() + row(shelf), 36.0),
         }
     }
 
     /// 展开态上半部分（不含暂存区那一行）的高度。
     fn base_height(self) -> f32 {
         match self {
-            Layout::ExpandedMedia { .. } => 150.0,
-            Layout::ExpandedDash { .. } => 108.0,
+            Layout::ExpandedMedia { lyric, .. } => 150.0 + if lyric { LYRIC_ROW } else { 0.0 },
+            Layout::ExpandedDash { .. } => 150.0,
             _ => self.dims().1,
         }
     }
 
     fn has_shelf(self) -> bool {
-        matches!(self, Layout::ExpandedMedia { shelf: true } | Layout::ExpandedDash { shelf: true })
+        matches!(self, Layout::ExpandedMedia { shelf: true, .. } | Layout::ExpandedDash { shelf: true })
+    }
+
+    fn is_expanded(self) -> bool {
+        matches!(self, Layout::ExpandedMedia { .. } | Layout::ExpandedDash { .. })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Toast {
+    Track,
+    Charging,
+    Level,
+    TimerDone,
+}
+
+impl Toast {
+    fn duration(self) -> Duration {
+        match self {
+            Toast::Level => Duration::from_millis(1600),
+            Toast::TimerDone => Duration::from_secs(6),
+            _ => Duration::from_millis(2800),
+        }
     }
 }
 
@@ -88,12 +124,11 @@ pub struct State {
     pub media_active: bool,
     pub media_visible: bool,
     pub files: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Toast {
-    Track,
-    Charging,
+    /// 展开时看的是仪表盘页（有音乐时可以滚轮切过去）。
+    pub dash_page: bool,
+    /// 当前歌曲有歌词。
+    pub lyrics: bool,
+    pub timer: bool,
 }
 
 /// 选择当前应显示的形态。纯函数，方便测试。
@@ -102,13 +137,25 @@ pub fn choose_layout(s: State) -> Layout {
         return Layout::Drop;
     }
     if s.expanded {
-        return if s.media_active { Layout::ExpandedMedia { shelf: s.files } } else { Layout::ExpandedDash { shelf: s.files } };
+        return if s.media_active && !s.dash_page {
+            Layout::ExpandedMedia { shelf: s.files, lyric: s.lyrics }
+        } else {
+            Layout::ExpandedDash { shelf: s.files }
+        };
     }
     match s.toast {
-        Some(Toast::Charging) => Layout::Charging,
-        Some(Toast::Track) if s.media_visible => Layout::TrackToast,
-        _ if s.media_visible => Layout::Media,
-        _ => Layout::Idle { files: s.files },
+        Some(Toast::Level) => return Layout::Level,
+        Some(Toast::TimerDone) => return Layout::TimerDone,
+        Some(Toast::Charging) => return Layout::Charging,
+        Some(Toast::Track) if s.media_visible => return Layout::TrackToast,
+        _ => {}
+    }
+    if s.media_visible {
+        Layout::Media { lyric: s.lyrics }
+    } else if s.timer {
+        Layout::Timer
+    } else {
+        Layout::Idle { files: s.files }
     }
 }
 
@@ -117,6 +164,10 @@ enum Btn {
     Prev,
     Toggle,
     Next,
+    StartTimer(u32),
+    AddMinute,
+    CancelTimer,
+    Page,
 }
 
 /// 暂存区里一个文件的格子。
@@ -131,7 +182,39 @@ struct Tile {
 enum PressOn {
     Tile(u64),
     Close(u64),
+    Seek,
     Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LevelKind {
+    Volume,
+    Brightness,
+}
+
+struct Level {
+    kind: LevelKind,
+    muted: bool,
+    fill: Spring,
+}
+
+struct Timer {
+    end: Instant,
+    total: f32,
+}
+
+impl Timer {
+    fn remaining(&self, now: Instant) -> f32 {
+        self.end.saturating_duration_since(now).as_secs_f32()
+    }
+}
+
+/// 歌词换行时的上滑过渡。
+struct LyricAnim {
+    idx: Option<usize>,
+    track: u64,
+    prev: String,
+    changed: Instant,
 }
 
 pub struct Island {
@@ -147,27 +230,38 @@ pub struct Island {
     leave_since: Option<Instant>,
     expanded: bool,
     pressed: bool,
+    dash_page: bool,
 
     pub media: Media,
     info: MediaInfo,
     art: Option<(u64, Image)>,
     last_track: u64,
     last_playing: Option<Instant>,
+    lyric: LyricAnim,
+    seek_bar: Option<Rect>,
+    bar_hover: bool,
+    /// 正在拖进度条：目标位置占比。
+    scrub: Option<f32>,
 
     battery: Option<Battery>,
     toast: Option<(Toast, Instant)>,
+    level: Option<Level>,
+    timer: Option<Timer>,
 
     pub shelf: Shelf,
     icons: HashMap<u64, Image>,
     tiles: Vec<Tile>,
     drop_hover: bool,
-    cursor: (f32, f32),
     hovered_tile: Option<u64>,
     press_on: Option<(PressOn, f32, f32)>,
     /// 要拖出去的文件 id，由主循环在借用之外发起拖放。
     pending_drag: Option<u64>,
 
     buttons: Vec<(Btn, Rect)>,
+    /// 调试：保持展开，不因鼠标离开而收起。
+    pin: bool,
+    /// 调试：用假的媒体信息，不跟系统同步。
+    fake_media: bool,
     anim_t: f32,
     last_tick: Instant,
     last_render: Instant,
@@ -199,22 +293,30 @@ impl Island {
             leave_since: None,
             expanded: false,
             pressed: false,
+            dash_page: false,
             media,
             info: MediaInfo::default(),
             art: None,
             last_track: 0,
             last_playing: None,
+            lyric: LyricAnim { idx: None, track: 0, prev: String::new(), changed: now },
+            seek_bar: None,
+            bar_hover: false,
+            scrub: None,
             battery: system::battery(),
             toast: None,
+            level: None,
+            timer: None,
             shelf,
             icons: HashMap::new(),
             tiles: Vec::new(),
             drop_hover: false,
-            cursor: (-1.0, -1.0),
             hovered_tile: None,
             press_on: None,
             pending_drag: None,
             buttons: Vec::new(),
+            pin: false,
+            fake_media: false,
             anim_t: 0.0,
             last_tick: now,
             last_render: now,
@@ -233,11 +335,15 @@ impl Island {
         self.rect().inflate(3.0).contains(x, y)
     }
 
+    pub fn is_scrubbing(&self) -> bool {
+        self.scrub.is_some()
+    }
+
     pub fn poll_system(&mut self) {
         let now_batt = system::battery();
         if let (Some(old), Some(new)) = (self.battery, now_batt) {
             if !old.charging && new.charging {
-                self.toast = Some((Toast::Charging, Instant::now()));
+                self.show_toast(Toast::Charging);
             }
             if old != new {
                 self.dirty = true;
@@ -246,14 +352,25 @@ impl Island {
         self.battery = now_batt;
     }
 
+    fn show_toast(&mut self, t: Toast) {
+        self.toast = Some((t, Instant::now()));
+        self.dirty = true;
+    }
+
+    // ---------- 鼠标 ----------
+
     pub fn on_mouse(&mut self, inside: bool, cursor: (f32, f32), now: Instant) {
-        self.cursor = cursor;
         let hovered = if inside { self.tile_at(cursor.0, cursor.1).map(|t| t.0) } else { None };
         if hovered != self.hovered_tile {
             self.hovered_tile = hovered;
             self.dirty = true;
         }
-        if inside {
+        let bar_hover = inside && self.seek_bar.is_some_and(|b| seek_zone(b).contains(cursor.0, cursor.1)) && self.info.can_seek;
+        if bar_hover != self.bar_hover {
+            self.bar_hover = bar_hover;
+            self.dirty = true;
+        }
+        if inside || self.scrub.is_some() {
             self.leave_since = None;
             let since = *self.hover_since.get_or_insert(now);
             if !self.expanded && now - since >= HOVER_DELAY {
@@ -265,10 +382,11 @@ impl Island {
                 self.pressed = false;
                 self.press.target = 1.0;
             }
-            if self.expanded {
+            if self.expanded && !self.pin {
                 let since = *self.leave_since.get_or_insert(now);
                 if now - since >= LEAVE_DELAY {
                     self.expanded = false;
+                    self.dash_page = false;
                     self.leave_since = None;
                 }
             }
@@ -289,28 +407,60 @@ impl Island {
         Some((t.id, t.close.contains(x, y)))
     }
 
-    pub fn mouse_down(&mut self, x: f32, y: f32) {
+    fn scrub_frac(&self, x: f32) -> f32 {
+        self.seek_bar.map(|b| ((x - b.x) / b.w).clamp(0.0, 1.0)).unwrap_or(0.0)
+    }
+
+    /// 返回 true 表示要捕获鼠标（拖进度条时光标可能移出窗口）。
+    pub fn mouse_down(&mut self, x: f32, y: f32) -> bool {
         self.pressed = true;
-        let on = match self.tile_at(x, y) {
-            Some((id, true)) => PressOn::Close(id),
-            Some((id, false)) => PressOn::Tile(id),
-            None => PressOn::Other,
+        let on_bar = matches!(self.shown, Layout::ExpandedMedia { .. })
+            && self.info.can_seek
+            && self.info.duration > 1.0
+            && self.seek_bar.is_some_and(|b| seek_zone(b).contains(x, y));
+        let on = if on_bar {
+            self.scrub = Some(self.scrub_frac(x));
+            self.dirty = true;
+            PressOn::Seek
+        } else {
+            match self.tile_at(x, y) {
+                Some((id, true)) => PressOn::Close(id),
+                Some((id, false)) => PressOn::Tile(id),
+                None => PressOn::Other,
+            }
         };
-        // 按在文件上时岛不缩，免得文件跟着抖
+        // 按在文件或进度条上时岛不缩，免得跟着抖
         if on == PressOn::Other {
             self.press.target = 0.96;
         }
         self.press_on = Some((on, x, y));
+        on_bar
     }
 
     pub fn mouse_move(&mut self, x: f32, y: f32) {
+        if self.scrub.is_some() {
+            self.scrub = Some(self.scrub_frac(x));
+            self.dirty = true;
+            return;
+        }
         if let Some((PressOn::Tile(id), px, py)) = self.press_on
-            && (x - px).hypot(y - py) >= DRAG_SLOP {
-                self.press_on = None;
-                self.pressed = false;
-                self.press.target = 1.0;
-                self.pending_drag = Some(id);
+            && (x - px).hypot(y - py) >= DRAG_SLOP
+        {
+            self.press_on = None;
+            self.pressed = false;
+            self.press.target = 1.0;
+            self.pending_drag = Some(id);
+        }
+    }
+
+    pub fn wheel(&mut self, delta: i32) {
+        if self.expanded && self.info.active {
+            let want_dash = delta < 0;
+            if want_dash != self.dash_page {
+                self.dash_page = want_dash;
+                self.dirty = true;
             }
+        }
     }
 
     pub fn take_drag(&mut self) -> Option<PathBuf> {
@@ -342,6 +492,15 @@ impl Island {
         self.pressed = false;
         self.press.target = 1.0;
         let press = self.press_on.take();
+        if let Some(frac) = self.scrub.take() {
+            let target = frac as f64 * self.info.duration;
+            self.media.send(Cmd::Seek(target));
+            // 乐观更新，免得松手后进度条先跳回去
+            self.info.position = target;
+            self.info.sampled_at = Some(Instant::now());
+            self.dirty = true;
+            return;
+        }
         if !self.expanded {
             // 点击直接展开，不用等悬停
             self.expand();
@@ -361,31 +520,107 @@ impl Island {
             }
             _ => {}
         }
-        if !matches!(self.shown, Layout::ExpandedMedia { .. }) {
-            return;
-        }
-        if let Some((b, _)) = self.buttons.iter().find(|(_, r)| r.contains(x, y)) {
-            self.media.send(match b {
-                Btn::Prev => Cmd::Prev,
-                Btn::Toggle => Cmd::Toggle,
-                Btn::Next => Cmd::Next,
-            });
-            // 乐观更新，让按钮立刻有反馈
-            if *b == Btn::Toggle {
+        let Some(&(b, _)) = self.buttons.iter().find(|(_, r)| r.contains(x, y)) else { return };
+        match b {
+            Btn::Prev => self.media.send(Cmd::Prev),
+            Btn::Next => self.media.send(Cmd::Next),
+            Btn::Toggle => {
+                self.media.send(Cmd::Toggle);
+                // 乐观更新，让按钮立刻有反馈
                 self.info.playing = !self.info.playing;
             }
-            self.dirty = true;
+            Btn::StartTimer(secs) => self.timer = Some(Timer { end: Instant::now() + Duration::from_secs(secs as u64), total: secs as f32 }),
+            Btn::AddMinute => {
+                if let Some(t) = &mut self.timer {
+                    t.end += Duration::from_secs(60);
+                    t.total += 60.0;
+                }
+            }
+            Btn::CancelTimer => self.timer = None,
+            Btn::Page => self.dash_page = !self.dash_page,
         }
+        self.dirty = true;
     }
+
+    // ---------- 外部事件 ----------
+
+    pub fn show_level(&mut self, kind: LevelKind, value: f32, muted: bool) {
+        let value = value.clamp(0.0, 1.0);
+        let showing = matches!(self.toast, Some((Toast::Level, _)));
+        match &mut self.level {
+            Some(l) if showing && l.kind == kind => {
+                l.fill.target = value;
+                l.muted = muted;
+            }
+            _ => {
+                let mut fill = Spring::new(value, 0.3, 1.0);
+                fill.target = value;
+                self.level = Some(Level { kind, muted, fill });
+            }
+        }
+        self.show_toast(Toast::Level);
+    }
+
+    /// 调试版专用：ISLAND_DEBUG=level|bright|timer|dash 直接进入某个形态，方便截图。
+    #[cfg(debug_assertions)]
+    pub fn debug_preset(&mut self, name: &str) {
+        match name {
+            "level" => self.show_level(LevelKind::Volume, 0.62, false),
+            "bright" => self.show_level(LevelKind::Brightness, 0.4, false),
+            "timer" => self.timer = Some(Timer { end: Instant::now() + Duration::from_secs(300), total: 300.0 }),
+            "dash" => {
+                self.timer = Some(Timer { end: Instant::now() + Duration::from_secs(300), total: 600.0 });
+                self.expanded = true;
+                self.pin = true;
+            }
+            "media" | "media_x" => {
+                let lrc = "[01:30.00]故事的小黄花
+[01:34.50]从出生那年就飘着
+[01:38.00]童年的荡秋千
+[01:41.50]随记忆一直晃到现在";
+                self.info = MediaInfo {
+                    active: true,
+                    title: "晴天".into(),
+                    artist: "周杰伦".into(),
+                    playing: true,
+                    position: 95.0,
+                    sampled_at: Some(Instant::now()),
+                    duration: 269.0,
+                    can_seek: true,
+                    lyrics: Some(std::sync::Arc::new(crate::lyrics::build(lrc, None))),
+                    track_id: 7,
+                    accent: [0.55, 0.78, 1.0],
+                    ..Default::default()
+                };
+                self.last_track = 7;
+                self.fake_media = true;
+                if name == "media_x" {
+                    self.expanded = true;
+                    self.pin = true;
+                    self.bar_hover = true;
+                }
+            }
+            "dash0" => {
+                self.expanded = true;
+                self.pin = true;
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    // ---------- 每帧 ----------
 
     pub fn tick(&mut self, now: Instant) {
         let dt = (now - self.last_tick).as_secs_f32();
         self.last_tick = now;
 
-        if let Some(info) = self.media.snapshot_if_newer(self.info.version) {
+        if self.fake_media {
+            self.info.sampled_at = Some(now - Duration::from_secs_f64(self.info.position - 95.0));
+        } else if let Some(info) = self.media.snapshot_if_newer(self.info.version) {
             if info.track_id != self.last_track {
                 if self.last_track != 0 && info.playing && info.active {
-                    self.toast = Some((Toast::Track, now));
+                    self.show_toast(Toast::Track);
                 }
                 self.last_track = info.track_id;
             }
@@ -395,10 +630,19 @@ impl Island {
         if self.info.playing {
             self.last_playing = Some(now);
         }
-        if let Some((_, t)) = self.toast
-            && now - t >= TOAST_TIME {
-                self.toast = None;
+        if let Some((t, at)) = self.toast
+            && now - at >= t.duration()
+        {
+            self.toast = None;
+        }
+        if self.timer.as_ref().is_some_and(|t| t.remaining(now) <= 0.0) {
+            self.timer = None;
+            self.show_toast(Toast::TimerDone);
+            unsafe {
+                let _ = MessageBeep(MB_ICONASTERISK);
             }
+        }
+        self.update_lyric(now);
 
         let media_visible = self.info.active && self.last_playing.is_some_and(|t| now - t < PAUSED_LINGER);
         let target = choose_layout(State {
@@ -408,6 +652,9 @@ impl Island {
             media_active: self.info.active,
             media_visible,
             files: !self.shelf.items.is_empty(),
+            dash_page: self.dash_page,
+            lyrics: self.info.lyrics.is_some(),
+            timer: self.timer.is_some(),
         });
         if target != self.target {
             self.target = target;
@@ -417,12 +664,18 @@ impl Island {
             self.r.target = r;
         }
 
-        // 内容先淡出，换成新形态的内容后，随尺寸接近目标再淡入
+        // 内容先淡出，换成新形态的内容后，随尺寸接近目标再淡入。
+        // 只是展开态内部变高变矮（多了暂存行、歌词行）时内容不用重来。
         if self.shown != self.target {
-            self.content_alpha -= dt / 0.07;
-            if self.content_alpha <= 0.0 {
-                self.content_alpha = 0.0;
+            let same_page = std::mem::discriminant(&self.shown) == std::mem::discriminant(&self.target) && self.target.is_expanded();
+            if same_page {
                 self.shown = self.target;
+            } else {
+                self.content_alpha -= dt / 0.07;
+                if self.content_alpha <= 0.0 {
+                    self.content_alpha = 0.0;
+                    self.shown = self.target;
+                }
             }
         } else if self.content_alpha < 1.0 {
             self.content_alpha = (self.content_alpha + dt / 0.22).min(1.0);
@@ -431,13 +684,38 @@ impl Island {
         for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press] {
             s.step(dt);
         }
+        if let Some(l) = &mut self.level {
+            l.fill.step(dt);
+        }
         self.anim_t += dt;
     }
 
+    fn lyric_text(&self, idx: Option<usize>) -> &str {
+        match (&self.info.lyrics, idx) {
+            (Some(l), Some(i)) => l.lines.get(i).map(|l| l.text.as_str()).unwrap_or(""),
+            _ => "",
+        }
+    }
+
+    fn update_lyric(&mut self, now: Instant) {
+        let idx = self.info.lyrics.as_ref().and_then(|l| l.index_at(self.info.position_now()));
+        if idx != self.lyric.idx || self.lyric.track != self.info.track_id {
+            let same_track = self.lyric.track == self.info.track_id;
+            self.lyric.prev = if same_track { self.lyric_text(self.lyric.idx).to_string() } else { String::new() };
+            self.lyric.idx = idx;
+            self.lyric.track = self.info.track_id;
+            self.lyric.changed = now;
+            self.dirty = true;
+        }
+    }
+
     fn animating(&self) -> bool {
+        let level_moving = self.shown == Layout::Level && self.level.as_ref().is_some_and(|l| !l.fill.settled());
         !(self.w.settled() && self.h.settled() && self.r.settled() && self.press.settled())
             || self.shown != self.target
             || self.content_alpha < 1.0
+            || level_moving
+            || self.lyric.changed.elapsed().as_secs_f32() < LYRIC_ANIM
     }
 
     /// 判断要不要现在出一帧，以及空闲时多久后再来。
@@ -445,8 +723,12 @@ impl Island {
         if self.animating() {
             return (true, Pace::Animating);
         }
+        let playing = self.info.playing;
+        let timer = self.timer.is_some();
         let periodic = match self.shown {
-            Layout::Media | Layout::TrackToast | Layout::ExpandedMedia { .. } if self.info.playing => Some(33),
+            Layout::Media { .. } | Layout::TrackToast | Layout::ExpandedMedia { .. } if playing => Some(33),
+            Layout::Media { .. } | Layout::Timer if timer => Some(250),
+            Layout::ExpandedDash { .. } if timer => Some(250),
             Layout::ExpandedDash { .. } => Some(1000),
             _ => None,
         };
@@ -455,6 +737,8 @@ impl Island {
         let wait = periodic.map(|p| p.saturating_sub(if due { 0 } else { since })).unwrap_or(40).clamp(1, 40);
         (due, Pace::Wait(wait))
     }
+
+    // ---------- 绘制 ----------
 
     pub fn render(&mut self, g: &Renderer) -> windows::core::Result<()> {
         self.last_render = Instant::now();
@@ -472,9 +756,10 @@ impl Island {
         self.icons.retain(|id, _| self.shelf.items.iter().any(|i| i.id == *id));
         for item in &self.shelf.items {
             if let (false, Some(px)) = (self.icons.contains_key(&item.id), &item.icon)
-                && let Ok(img) = g.image(px, ICON) {
-                    self.icons.insert(item.id, img);
-                }
+                && let Ok(img) = g.image(px, ICON)
+            {
+                self.icons.insert(item.id, img);
+            }
         }
 
         g.begin();
@@ -493,6 +778,7 @@ impl Island {
         let a = self.content_alpha * (1.0 - gap / 90.0).clamp(0.0, 1.0);
         self.buttons.clear();
         self.tiles.clear();
+        self.seek_bar = None;
         if a > 0.01 {
             // 形变途中内容不能溢出岛外；上下各让出圆角的一部分
             let inset = (radius * 0.3).min(8.0);
@@ -503,15 +789,18 @@ impl Island {
                         self.draw_idle_files(g, r, a);
                     }
                 }
-                Layout::Media => self.draw_compact(g, r, a, None),
-                Layout::TrackToast => {
-                    let title = self.info.title.clone();
-                    self.draw_compact(g, r, a, Some(&title));
-                }
+                Layout::Media { lyric } => self.draw_compact(g, r, a, if lyric { Middle::Lyric } else { Middle::None }),
+                Layout::TrackToast => self.draw_compact(g, r, a, Middle::Title),
                 Layout::Charging => self.draw_charging(g, r, a),
+                Layout::Level => self.draw_level(g, r, a),
+                Layout::Timer => self.draw_timer_compact(g, r, a),
+                Layout::TimerDone => self.draw_timer_done(g, r, a),
                 Layout::Drop => self.draw_drop(g, r, a),
-                Layout::ExpandedMedia { .. } => self.draw_expanded_media(g, r, a),
+                Layout::ExpandedMedia { lyric, .. } => self.draw_expanded_media(g, r, a, lyric),
                 Layout::ExpandedDash { .. } => self.draw_dash(g, r, a),
+            }
+            if self.shown.is_expanded() && self.info.active {
+                self.draw_page_dots(g, r, a);
             }
             if self.shown.has_shelf() {
                 let base = self.shown.base_height();
@@ -583,6 +872,17 @@ impl Island {
         }
     }
 
+    fn draw_page_dots(&mut self, g: &Renderer, r: Rect, a: f32) {
+        let cx = r.x + r.w / 2.0;
+        let y = r.y + 9.0;
+        for (i, dash) in [false, true].into_iter().enumerate() {
+            let on = self.dash_page == dash;
+            let x = cx - 7.0 + i as f32 * 10.0;
+            g.fill_rrect(Rect::new(x, y, 5.0, 5.0), 2.5, with_alpha(WHITE, if on { 0.85 } else { 0.25 } * a));
+        }
+        self.buttons.push((Btn::Page, Rect::new(cx - 24.0, r.y, 48.0, 20.0)));
+    }
+
     fn draw_art(&self, g: &Renderer, r: Rect, radius: f32, a: f32) {
         match &self.art {
             Some((_, img)) => g.draw_image(img, r, radius, a),
@@ -597,9 +897,13 @@ impl Island {
         }
     }
 
+    fn accent(&self) -> Color {
+        let [r, g, b] = self.info.accent;
+        rgba(r, g, b, 1.0)
+    }
+
     fn draw_bars(&self, g: &Renderer, right: f32, cy: f32, max_h: f32, a: f32) {
-        let [cr, cg, cb] = self.info.accent;
-        let c = rgba(cr, cg, cb, a);
+        let c = with_alpha(self.accent(), a);
         let t = self.anim_t;
         let (bw, gap) = (3.0, 2.5);
         for i in 0..4 {
@@ -616,12 +920,59 @@ impl Island {
         }
     }
 
-    fn draw_compact(&self, g: &Renderer, r: Rect, a: f32, title: Option<&str>) {
+    /// 当前歌词，换行时旧行上滑淡出、新行从下方滑入。
+    fn draw_lyric(&self, g: &Renderer, rect: Rect, a: f32, c: Color) {
+        let p = (self.lyric.changed.elapsed().as_secs_f32() / LYRIC_ANIM).clamp(0.0, 1.0);
+        let e = 1.0 - (1.0 - p) * (1.0 - p);
+        let shift = 9.0;
+        let cur = self.lyric_text(self.lyric.idx);
+        let cur = if cur.is_empty() { "♪" } else { cur };
+        if p < 1.0 && !self.lyric.prev.is_empty() {
+            let old = Rect::new(rect.x, rect.y - e * shift, rect.w, rect.h);
+            g.text(&self.lyric.prev, &g.fonts.lyric_center, old, with_alpha(c, a * (1.0 - e)));
+        }
+        let new = Rect::new(rect.x, rect.y + (1.0 - e) * shift, rect.w, rect.h);
+        g.text(cur, &g.fonts.lyric_center, new, with_alpha(c, a * e));
+    }
+
+    fn timer_text(&self) -> String {
+        let s = self.timer.as_ref().map(|t| t.remaining(Instant::now())).unwrap_or(0.0);
+        system::fmt_secs(s.ceil() as f64)
+    }
+
+    fn timer_frac(&self) -> f32 {
+        self.timer.as_ref().map(|t| t.remaining(Instant::now()) / t.total.max(1.0)).unwrap_or(0.0)
+    }
+}
+
+/// 紧凑态中间放什么。
+#[derive(Clone, Copy, PartialEq)]
+enum Middle {
+    None,
+    Title,
+    Lyric,
+}
+
+/// 进度条的可点击区域：上下放宽，方便点中。
+fn seek_zone(bar: Rect) -> Rect {
+    Rect::new(bar.x - 6.0, bar.y - 9.0, bar.w + 12.0, bar.h + 18.0)
+}
+
+impl Island {
+    fn draw_compact(&self, g: &Renderer, r: Rect, a: f32, middle: Middle) {
         let art = Rect::new(r.x + 6.0, r.y + (r.h - 22.0) / 2.0, 22.0, 22.0);
         self.draw_art(g, art, 6.0, a);
-        self.draw_bars(g, r.x + r.w - 14.0, r.y + r.h / 2.0, 14.0, a);
-        if let Some(t) = title {
-            g.text(t, &g.fonts.small, Rect::new(r.x + 38.0, r.y, r.w - 38.0 - 44.0, r.h), with_alpha(WHITE, a));
+        if self.timer.is_some() {
+            // 有计时器时，右边显示倒计时而不是频谱
+            g.text(&self.timer_text(), &g.fonts.small_right, Rect::new(r.x + r.w - 58.0, r.y, 46.0, r.h), with_alpha(ORANGE, a));
+        } else {
+            self.draw_bars(g, r.x + r.w - 14.0, r.y + r.h / 2.0, 14.0, a);
+        }
+        let mid = Rect::new(r.x + 38.0, r.y, r.w - 38.0 - 62.0, r.h);
+        match middle {
+            Middle::None => {}
+            Middle::Title => g.text(&self.info.title, &g.fonts.small, mid, with_alpha(WHITE, a)),
+            Middle::Lyric => self.draw_lyric(g, Rect::new(mid.x + 4.0, r.y, mid.w - 8.0, r.h), a, WHITE),
         }
     }
 
@@ -647,7 +998,68 @@ impl Island {
         g.fill_rrect(Rect::new(x + 2.0, cy - 4.0, w, 8.0), 2.0, with_alpha(fill_c, a));
     }
 
-    fn draw_expanded_media(&mut self, g: &Renderer, r: Rect, a: f32) {
+    fn draw_level(&self, g: &Renderer, r: Rect, a: f32) {
+        let Some(l) = &self.level else { return };
+        let cy = r.y + r.h / 2.0;
+        let x = r.x + 18.0;
+        let c = with_alpha(WHITE, a);
+        match l.kind {
+            LevelKind::Volume => {
+                // 喇叭
+                g.fill_rrect(Rect::new(x, cy - 3.5, 4.0, 7.0), 1.0, c);
+                g.fill_poly(&[(x + 3.0, cy - 3.5), (x + 9.0, cy - 8.0), (x + 9.0, cy + 8.0), (x + 3.0, cy + 3.5)], c);
+                if l.muted || l.fill.target <= 0.001 {
+                    g.line((x + 12.0, cy - 3.5), (x + 19.0, cy + 3.5), 1.6, c);
+                    g.line((x + 12.0, cy + 3.5), (x + 19.0, cy - 3.5), 1.6, c);
+                } else {
+                    g.line((x + 12.5, cy - 3.0), (x + 13.5, cy), 1.6, c);
+                    g.line((x + 13.5, cy), (x + 12.5, cy + 3.0), 1.6, c);
+                    if l.fill.target > 0.5 {
+                        g.line((x + 15.5, cy - 6.0), (x + 17.5, cy), 1.6, c);
+                        g.line((x + 17.5, cy), (x + 15.5, cy + 6.0), 1.6, c);
+                    }
+                }
+            }
+            LevelKind::Brightness => {
+                // 太阳
+                let (sx, sy) = (x + 8.0, cy);
+                g.fill_rrect(Rect::new(sx - 3.5, sy - 3.5, 7.0, 7.0), 3.5, c);
+                for i in 0..8 {
+                    let ang = i as f32 * std::f32::consts::FRAC_PI_4;
+                    let (s, co) = ang.sin_cos();
+                    g.line((sx + co * 6.0, sy + s * 6.0), (sx + co * 8.5, sy + s * 8.5), 1.5, c);
+                }
+            }
+        }
+        let bar = Rect::new(x + 32.0, cy - 3.0, r.w - 32.0 - 18.0 - 32.0 - 44.0, 6.0);
+        g.fill_rrect(bar, 3.0, with_alpha(WHITE, 0.18 * a));
+        let v = l.fill.value.clamp(0.0, 1.0);
+        let fc = if l.muted { with_alpha(WHITE, 0.35 * a) } else { c };
+        if v > 0.0 {
+            g.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * v).max(6.0), bar.h), 3.0, fc);
+        }
+        let pct = if l.muted { "静音".to_string() } else { format!("{}", (l.fill.target * 100.0).round() as i32) };
+        g.text(&pct, &g.fonts.small_right, Rect::new(r.x + r.w - 18.0 - 44.0, r.y, 44.0, r.h), c);
+    }
+
+    fn draw_timer_compact(&self, g: &Renderer, r: Rect, a: f32) {
+        let cy = r.y + r.h / 2.0;
+        let cx = r.x + 20.0;
+        g.arc(cx, cy, 8.0, 1.0, 2.5, with_alpha(ORANGE, 0.25 * a));
+        g.arc(cx, cy, 8.0, self.timer_frac(), 2.5, with_alpha(ORANGE, a));
+        g.text(&self.timer_text(), &g.fonts.title, Rect::new(r.x + r.w - 16.0 - 80.0, r.y, 80.0, r.h), with_alpha(ORANGE, a));
+    }
+
+    fn draw_timer_done(&self, g: &Renderer, r: Rect, a: f32) {
+        let cy = r.y + r.h / 2.0;
+        let cx = r.x + 20.0;
+        // 铃铛一样跳动的圆环
+        let pulse = 1.0 + 0.12 * (self.anim_t * 9.0).sin().abs();
+        g.arc(cx, cy, 8.0 * pulse, 1.0, 2.5, with_alpha(ORANGE, a));
+        g.text("计时结束", &g.fonts.small, Rect::new(cx + 18.0, r.y, 140.0, r.h), with_alpha(WHITE, a));
+    }
+
+    fn draw_expanded_media(&mut self, g: &Renderer, r: Rect, a: f32, lyric: bool) {
         let pad = 20.0;
         let art = Rect::new(r.x + pad, r.y + pad, 62.0, 62.0);
         self.draw_art(g, art, 14.0, a);
@@ -659,15 +1071,25 @@ impl Island {
         self.draw_bars(g, r.x + r.w - pad, art.y + 19.0, 16.0, a);
 
         let mut row_y = art.y + art.h + 14.0;
+        if lyric {
+            self.draw_lyric(g, Rect::new(r.x + pad, row_y - 6.0, r.w - 2.0 * pad, 24.0), a, self.accent());
+            row_y += LYRIC_ROW;
+        }
         if self.info.duration > 1.0 {
-            let pos = self.info.position_now();
-            let bar = Rect::new(r.x + pad + 40.0, row_y + 6.0, r.w - 2.0 * pad - 80.0, 5.0);
-            g.fill_rrect(bar, 2.5, with_alpha(WHITE, 0.18 * a));
+            let pos = match self.scrub {
+                Some(f) => f as f64 * self.info.duration,
+                None => self.info.position_now(),
+            };
+            let thick = self.scrub.is_some() || self.bar_hover;
+            let bh = if thick { 8.0 } else { 5.0 };
+            let bar = Rect::new(r.x + pad + 40.0, row_y + 8.5 - bh / 2.0, r.w - 2.0 * pad - 80.0, bh);
+            g.fill_rrect(bar, bh / 2.0, with_alpha(WHITE, 0.18 * a));
             let p = (pos / self.info.duration).clamp(0.0, 1.0) as f32;
-            g.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * p).max(5.0), bar.h), 2.5, with_alpha(WHITE, 0.85 * a));
+            g.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * p).max(bh), bar.h), bh / 2.0, with_alpha(WHITE, 0.85 * a));
             let lc = with_alpha(WHITE, 0.5 * a);
             g.text(&system::fmt_secs(pos), &g.fonts.small, Rect::new(r.x + pad, row_y, 36.0, 17.0), lc);
             g.text(&format!("-{}", system::fmt_secs(self.info.duration - pos)), &g.fonts.small_right, Rect::new(r.x + r.w - pad - 40.0, row_y, 40.0, 17.0), lc);
+            self.seek_bar = Some(Rect::new(bar.x, row_y + 6.0, bar.w, 5.0));
             row_y += 20.0;
         }
 
@@ -675,8 +1097,6 @@ impl Island {
         let cx = r.x + r.w / 2.0;
         let c = with_alpha(WHITE, a);
         for (btn, bx) in [(Btn::Prev, cx - 64.0), (Btn::Toggle, cx), (Btn::Next, cx + 64.0)] {
-            let pressed_dim = if self.pressed { 0.9 } else { 1.0 };
-            let c = with_alpha(c, pressed_dim);
             match btn {
                 Btn::Toggle if self.info.playing => {
                     g.fill_rrect(Rect::new(bx - 7.5, cy - 9.0, 5.0, 18.0), 1.5, c);
@@ -687,7 +1107,7 @@ impl Island {
                     g.fill_poly(&[(bx - 11.0, cy - 7.0), (bx, cy), (bx - 11.0, cy + 7.0)], c);
                     g.fill_poly(&[(bx, cy - 7.0), (bx + 11.0, cy), (bx, cy + 7.0)], c);
                 }
-                Btn::Prev => {
+                _ => {
                     g.fill_poly(&[(bx + 11.0, cy - 7.0), (bx, cy), (bx + 11.0, cy + 7.0)], c);
                     g.fill_poly(&[(bx, cy - 7.0), (bx - 11.0, cy), (bx, cy + 7.0)], c);
                 }
@@ -696,17 +1116,43 @@ impl Island {
         }
     }
 
-    fn draw_dash(&self, g: &Renderer, r: Rect, a: f32) {
+    /// 胶囊按钮。
+    fn pill(&mut self, g: &Renderer, r: Rect, label: &str, c: Color, btn: Btn, a: f32) {
+        g.fill_rrect(r, r.h / 2.0, with_alpha(c, 0.18 * a));
+        g.text(label, &g.fonts.small_center, r, with_alpha(c, a));
+        self.buttons.push((btn, r));
+    }
+
+    fn draw_dash(&mut self, g: &Renderer, r: Rect, a: f32) {
         let clock = system::clock();
         let pad = 24.0;
-        g.text(&clock.time, &g.fonts.clock, Rect::new(r.x + pad, r.y + 16.0, 160.0, 46.0), with_alpha(WHITE, a));
-        g.text(&clock.date, &g.fonts.body, Rect::new(r.x + pad + 2.0, r.y + 62.0, 200.0, 22.0), with_alpha(WHITE, 0.55 * a));
+        g.text(&clock.time, &g.fonts.clock, Rect::new(r.x + pad, r.y + 14.0, 160.0, 46.0), with_alpha(WHITE, a));
+        g.text(&clock.date, &g.fonts.body, Rect::new(r.x + pad + 2.0, r.y + 58.0, 200.0, 22.0), with_alpha(WHITE, 0.55 * a));
         if let Some(b) = self.battery {
             let bx = r.x + r.w - pad - 26.0;
-            let cy = r.y + 38.0;
+            let cy = r.y + 36.0;
             self.draw_battery(g, bx, cy, b, a);
             let c = if b.charging { GREEN } else { WHITE };
             g.text(&format!("{}%", b.percent), &g.fonts.small_right, Rect::new(bx - 64.0, cy - 9.0, 58.0, 18.0), with_alpha(c, a));
+        }
+
+        // 计时器一行
+        let row = Rect::new(r.x + pad, r.y + 100.0, r.w - 2.0 * pad, 28.0);
+        if self.timer.is_some() {
+            let cy = row.y + row.h / 2.0;
+            g.arc(row.x + 11.0, cy, 9.0, 1.0, 2.5, with_alpha(ORANGE, 0.25 * a));
+            g.arc(row.x + 11.0, cy, 9.0, self.timer_frac(), 2.5, with_alpha(ORANGE, a));
+            g.text(&self.timer_text(), &g.fonts.title, Rect::new(row.x + 30.0, row.y, 90.0, row.h), with_alpha(ORANGE, a));
+            let right = row.x + row.w;
+            self.pill(g, Rect::new(right - 160.0, row.y, 78.0, row.h), "+1 分钟", ORANGE, Btn::AddMinute, a);
+            self.pill(g, Rect::new(right - 74.0, row.y, 74.0, row.h), "取消", WHITE, Btn::CancelTimer, a);
+        } else {
+            let presets = [(60, "1 分钟"), (300, "5 分钟"), (900, "15 分钟"), (1500, "25 分钟")];
+            let w = (row.w - 3.0 * 8.0) / 4.0;
+            for (i, (secs, label)) in presets.into_iter().enumerate() {
+                let pr = Rect::new(row.x + i as f32 * (w + 8.0), row.y, w, row.h);
+                self.pill(g, pr, label, ORANGE, Btn::StartTimer(secs), a);
+            }
         }
     }
 }
@@ -725,10 +1171,16 @@ mod tests {
 
     #[test]
     fn expanded_wins() {
-        assert_eq!(choose_layout(st(true, Some(Toast::Charging), true, true)), Layout::ExpandedMedia { shelf: false });
+        assert_eq!(choose_layout(st(true, Some(Toast::Charging), true, true)), Layout::ExpandedMedia { shelf: false, lyric: false });
         assert_eq!(choose_layout(st(true, None, false, false)), Layout::ExpandedDash { shelf: false });
-        let with_files = State { files: true, ..st(true, None, true, true) };
-        assert_eq!(choose_layout(with_files), Layout::ExpandedMedia { shelf: true });
+        let with_files = State { files: true, lyrics: true, ..st(true, None, true, true) };
+        assert_eq!(choose_layout(with_files), Layout::ExpandedMedia { shelf: true, lyric: true });
+    }
+
+    #[test]
+    fn dash_page_when_media_playing() {
+        let s = State { dash_page: true, ..st(true, None, true, true) };
+        assert_eq!(choose_layout(s), Layout::ExpandedDash { shelf: false });
     }
 
     #[test]
@@ -740,11 +1192,21 @@ mod tests {
     #[test]
     fn toasts_and_media() {
         assert_eq!(choose_layout(st(false, Some(Toast::Charging), false, false)), Layout::Charging);
+        assert_eq!(choose_layout(st(false, Some(Toast::Level), true, true)), Layout::Level);
+        assert_eq!(choose_layout(st(false, Some(Toast::TimerDone), false, false)), Layout::TimerDone);
         assert_eq!(choose_layout(st(false, Some(Toast::Track), true, true)), Layout::TrackToast);
         // 音乐已经隐藏时，切歌提示不弹
         assert_eq!(choose_layout(st(false, Some(Toast::Track), true, false)), Layout::Idle { files: false });
-        assert_eq!(choose_layout(st(false, None, true, true)), Layout::Media);
+        assert_eq!(choose_layout(st(false, None, true, true)), Layout::Media { lyric: false });
+        assert_eq!(choose_layout(State { lyrics: true, ..st(false, None, true, true) }), Layout::Media { lyric: true });
         assert_eq!(choose_layout(State { files: true, ..st(false, None, false, false) }), Layout::Idle { files: true });
+    }
+
+    #[test]
+    fn timer_shows_when_no_music() {
+        assert_eq!(choose_layout(State { timer: true, ..st(false, None, false, false) }), Layout::Timer);
+        // 有音乐时音乐优先（倒计时画在音乐紧凑态的右边）
+        assert_eq!(choose_layout(State { timer: true, ..st(false, None, true, true) }), Layout::Media { lyric: false });
     }
 
     #[test]
@@ -752,12 +1214,16 @@ mod tests {
         let all = [
             Layout::Idle { files: false },
             Layout::Idle { files: true },
-            Layout::Media,
+            Layout::Media { lyric: false },
+            Layout::Media { lyric: true },
             Layout::TrackToast,
             Layout::Charging,
+            Layout::Level,
+            Layout::Timer,
+            Layout::TimerDone,
             Layout::Drop,
-            Layout::ExpandedMedia { shelf: false },
-            Layout::ExpandedMedia { shelf: true },
+            Layout::ExpandedMedia { shelf: false, lyric: false },
+            Layout::ExpandedMedia { shelf: true, lyric: true },
             Layout::ExpandedDash { shelf: false },
             Layout::ExpandedDash { shelf: true },
         ];
@@ -773,5 +1239,12 @@ mod tests {
         let (w, ..) = Layout::ExpandedDash { shelf: true }.dims();
         let used = 2.0 * 20.0 + shelf::MAX_ITEMS as f32 * (TILE_W + TILE_GAP);
         assert!(used <= w, "{used} > {w}");
+    }
+
+    #[test]
+    fn seek_zone_is_generous() {
+        let z = seek_zone(Rect::new(100.0, 50.0, 200.0, 5.0));
+        assert!(z.contains(100.0, 42.0) && z.contains(300.0, 62.0));
+        assert!(!z.contains(100.0, 30.0));
     }
 }
