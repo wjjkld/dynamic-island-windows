@@ -792,6 +792,25 @@ impl Island {
     /// 调试版专用：ISLAND_DEBUG=level|bright|timer|dash 直接进入某个形态，方便截图。
     #[cfg(debug_assertions)]
     pub fn debug_preset(&mut self, name: &str) {
+        // 截图用的假封面：两色对角渐变加一个柔光圆，BGRA 不透明
+        fn fake_art(a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
+            let n = ART as usize;
+            let mut px = Vec::with_capacity(n * n * 4);
+            for y in 0..n {
+                for x in 0..n {
+                    let t = (x + y) as f32 / (2 * n - 2) as f32;
+                    let (dx, dy) = (x as f32 - n as f32 * 0.68, y as f32 - n as f32 * 0.32);
+                    let glow = (1.0 - (dx * dx + dy * dy).sqrt() / (n as f32 * 0.42)).clamp(0.0, 1.0).powi(2) * 0.55;
+                    let c = |i: usize| {
+                        let v = a[i] as f32 * (1.0 - t) + b[i] as f32 * t;
+                        (v + (255.0 - v) * glow) as u8
+                    };
+                    px.extend_from_slice(&[c(2), c(1), c(0), 255]);
+                }
+            }
+            px
+        }
+
         match name {
             "level" => self.show_level(LevelKind::Volume, 0.62, false),
             "bright" => self.show_level(LevelKind::Brightness, 0.4, false),
@@ -802,14 +821,14 @@ impl Island {
                 self.pin = true;
             }
             "media" | "media_x" => {
-                let lrc = "[01:30.00]故事的小黄花
-[01:34.50]从出生那年就飘着
-[01:38.00]童年的荡秋千
-[01:41.50]随记忆一直晃到现在";
+                let lrc = "[01:30.00]路灯一盏一盏亮起来
+[01:34.50]晚风把云吹成海
+[01:38.00]我数着站台等你来
+[01:41.50]这城市刚好不太快";
                 self.info = MediaInfo {
                     active: true,
-                    title: "晴天".into(),
-                    artist: "周杰伦".into(),
+                    title: "晚风站台".into(),
+                    artist: "示例歌手".into(),
                     playing: true,
                     position: 95.0,
                     sampled_at: Some(Instant::now()),
@@ -817,9 +836,10 @@ impl Island {
                     can_seek: true,
                     lyrics: Some(std::sync::Arc::new(crate::lyrics::build(lrc, None))),
                     track_id: 7,
-                    accent: [0.55, 0.78, 1.0],
+                    art: Some(std::sync::Arc::new(fake_art([255, 138, 101], [94, 53, 177]))),
                     ..Default::default()
                 };
+                self.info.accent = crate::media::accent_of(self.info.art.as_deref().unwrap());
                 self.last_track = 7;
                 self.fake_media = true;
                 if name == "media_x" {
@@ -830,11 +850,11 @@ impl Island {
             }
             "trans" => {
                 self.debug_preset("media_x");
-                let lrc = "[01:30.00]Look at the stars\n[01:34.50]Look how they shine for you\n[01:38.00]And everything you do";
-                let tl = "[01:30.00]看看那些星星\n[01:34.50]看它们为你闪耀\n[01:38.00]还有你做的一切";
+                let lrc = "[01:30.00]Paper boats on a silver tide\n[01:34.50]Carry every word I never said\n[01:38.00]Somewhere the morning waits for us";
+                let tl = "[01:30.00]纸船漂在银色的潮水上\n[01:34.50]载着我没说出口的话\n[01:38.00]清晨在某处等着我们";
                 self.info.lyrics = Some(std::sync::Arc::new(crate::lyrics::build(lrc, Some(tl))));
-                self.info.title = "Yellow".into();
-                self.info.artist = "Coldplay".into();
+                self.info.title = "Paper Boats".into();
+                self.info.artist = "Demo Artist".into();
             }
             "privacy" => self.set_privacy(InUse { mic: vec!["WeChat".into()], cam: vec![] }),
             "dots" => {
@@ -865,7 +885,7 @@ impl Island {
             }
             "split" | "split_x" => {
                 self.debug_preset("media");
-                self.info.other = Some(crate::media::Other { app: "Chrome".into(), title: "视频".into(), art: None, art_id: 1 });
+                self.info.other = Some(crate::media::Other { app: "Chrome".into(), title: "视频".into(), art: Some(std::sync::Arc::new(fake_art([77, 208, 225], [26, 35, 126]))), art_id: 1 });
                 self.info.app = "网易云音乐".into();
                 if name == "split_x" {
                     self.expanded = true;

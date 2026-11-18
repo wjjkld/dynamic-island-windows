@@ -286,9 +286,9 @@ mod tests {
 
     #[test]
     fn drops_credits_and_merges_translation() {
-        let ly = build("[00:00.00]作词 : 周杰伦\n[00:28.00]故事的小黄花\n[00:31.00]Hello", Some("[00:31.00]你好"));
+        let ly = build("[00:00.00]作词 : 某某\n[00:28.00]路灯一盏一盏亮起来\n[00:31.00]Hello", Some("[00:31.00]你好"));
         assert_eq!(ly.lines.len(), 2);
-        assert_eq!(ly.lines[0].text, "故事的小黄花");
+        assert_eq!(ly.lines[0].text, "路灯一盏一盏亮起来");
         assert_eq!(ly.lines[1].trans.as_deref(), Some("你好"));
     }
 

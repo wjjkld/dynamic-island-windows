@@ -2,6 +2,8 @@
 
 轻量的 Windows 灵动岛。Rust + Win32 + Direct2D + DirectComposition，无运行时、无 WebView，单个 exe 约 700 KB。
 
+<p align="center"><img src="docs/screenshots/trans.png" width="620" alt="展开的播放卡片：封面、歌名、双语歌词、进度条和播放控制"></p>
+
 ## 为什么选它
 
 - **小而轻**：一个约 700 KB 的 exe，不用安装，不依赖 .NET、Electron、WebView 或 VC++ 运行库；
@@ -15,6 +17,37 @@
 - **一站式**：音乐控制、歌词、拖动进度、文件暂存区、天气、电量和剩余时间、计时器、便签都在一个岛上
 - **尊重隐私**：没有账号、没有统计上报；只有歌词和天气会联网，只发必要的信息，都能在菜单里关掉；数据都存在本机
 - **开源**：MIT 许可，代码约 6000 行，可以自己审查、修改、编译
+
+## 截图
+
+平时是一条贴在屏幕顶部的小胶囊，鼠标移上去展开；滚轮在播放、仪表盘、便签几页之间切换。
+
+<p align="center">
+  <img src="docs/screenshots/media.png" width="49%" alt="收起状态：封面、当前一句歌词、跳动的频谱">
+  <img src="docs/screenshots/split.png" width="49%" alt="两个播放器同时在放：右边分出小圆泡">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/split_x.png" width="49%" alt="展开播放卡片，右上角可一键切到另一个播放器">
+  <img src="docs/screenshots/weather.png" width="49%" alt="仪表盘：时间日期、天气、电量和计时器快捷按钮">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/notes.png" width="49%" alt="便签页：随手记的想法，可复制、删除">
+  <img src="docs/screenshots/connected.png" width="49%" alt="蓝牙耳机连接提示，带耳机电量">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/level.png" width="49%" alt="音量提示，替代系统音量浮窗">
+  <img src="docs/screenshots/charging.png" width="49%" alt="插上电源时的充电提示">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/timer.png" width="49%" alt="计时器倒计时">
+  <img src="docs/screenshots/privacy.png" width="49%" alt="有程序在用麦克风时的提示">
+</p>
+
+> 截图里的歌名、歌词和封面都是演示用的假数据（`ISLAND_DEBUG` 预设）。
 
 ## 下载使用
 
