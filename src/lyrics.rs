@@ -107,12 +107,8 @@ pub fn find(q: &Query) -> Option<Lyrics> {
         return parse_cached(&text);
     }
     let cjk = q.title.chars().chain(q.artist.chars()).any(is_cjk);
-    let (lrc, tlrc) = if cjk {
-        netease(q).or_else(|| lrclib(q).map(|l| (l, None)))
-    } else {
-        lrclib(q).map(|l| (l, None)).or_else(|| netease(q))
-    }
-    .unwrap_or_default();
+    let hit = if cjk { pick(netease(q), || lrclib(q)) } else { pick(lrclib(q), || netease(q)) };
+    let (lrc, tlrc) = hit.map(|h| (h.lrc, h.tlrc)).unwrap_or_default();
     let lyrics = (!lrc.is_empty()).then(|| build(&lrc, tlrc.as_deref())).filter(|l| !l.lines.is_empty());
     if let Some(p) = cache {
         if let Some(dir) = p.parent() {
@@ -137,9 +133,9 @@ fn parse_cached(text: &str) -> Option<Lyrics> {
 
 fn cache_path(q: &Query) -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA")?;
-    // FNV-1a，够用来做文件名
+    // FNV-1a，够用来做文件名。v2：繁简体统一以后重新查一遍，旧版可能缓存了匹配错的歌词
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in format!("{}\u{1}{}", q.artist.to_lowercase(), q.title.to_lowercase()).bytes() {
+    for b in format!("v2\u{1}{}\u{1}{}", simplify(q.artist).to_lowercase(), simplify(q.title).to_lowercase()).bytes() {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     Some(PathBuf::from(base).join("WinDynamicIsland").join("lyrics").join(format!("{h:016x}.lrc")))
@@ -182,17 +178,67 @@ pub fn get(url: &str, referer: Option<&str>) -> Result<String> {
     }
 }
 
-/// 给候选结果打分：歌手对得上、时长接近的优先。
+/// 候选得分达到这个才采用。
+const ACCEPT: f64 = 3.0;
+
+/// 繁体转简体（系统自带的 LCMapStringEx）。Spotify 等给的中文歌名常是繁体，网易云是简体。
+fn simplify(s: &str) -> String {
+    use windows::Win32::Globalization::{LCMAP_SIMPLIFIED_CHINESE, LCMapStringEx};
+    use windows::Win32::Foundation::LPARAM;
+    if !s.chars().any(is_cjk) {
+        return s.to_string();
+    }
+    let src: Vec<u16> = s.encode_utf16().collect();
+    let mut out = vec![0u16; src.len() * 2 + 8];
+    let n = unsafe { LCMapStringEx(h!("zh-CN"), LCMAP_SIMPLIFIED_CHINESE, &src, Some(&mut out), None, None, LPARAM(0)) };
+    if n <= 0 {
+        return s.to_string();
+    }
+    String::from_utf16_lossy(&out[..n as usize])
+}
+
+/// 一个来源里得分最高的结果。
+struct Hit {
+    score: f64,
+    /// 歌手对得上。对不上多半是翻唱（比如网易云没有原唱版权时只搜得到翻唱）。
+    artist_ok: bool,
+    lrc: String,
+    tlrc: Option<String>,
+}
+
+/// 先问的来源歌手对得上就用它；对不上再问另一个来源，取得分高的。
+fn pick(first: Option<Hit>, second: impl FnOnce() -> Option<Hit>) -> Option<Hit> {
+    match first {
+        Some(h) if h.artist_ok => Some(h),
+        first => match (first, second()) {
+            (Some(a), Some(b)) => Some(if b.score > a.score { b } else { a }),
+            (a, b) => a.or(b),
+        },
+    }
+}
+
+fn norm(s: &str) -> String {
+    simplify(s).to_lowercase().replace(' ', "")
+}
+
+fn artist_ok(cand_artists: &str, q: &Query) -> bool {
+    let (ca, qa) = (norm(cand_artists), norm(q.artist));
+    !qa.is_empty() && qa.split(['/', ',', '、', '&']).any(|a| !a.is_empty() && ca.contains(a))
+}
+
+/// 给候选结果打分：歌手对得上、时长接近的优先。繁简体、大小写、空格不影响比较。
 fn score(cand_title: &str, cand_artists: &str, cand_dur: f64, q: &Query) -> f64 {
-    let norm = |s: &str| s.to_lowercase().replace(' ', "");
-    let (ct, ca, qt, qa) = (norm(cand_title), norm(cand_artists), norm(q.title), norm(q.artist));
+    let (ct, qt) = (norm(cand_title), norm(q.title));
     let mut s = 0.0;
     if ct == qt {
         s += 3.0;
     } else if ct.contains(&qt) || qt.contains(&ct) {
         s += 1.0;
+    } else {
+        // 歌名对不上就是别的歌，歌手和时长再像也不要
+        s -= 5.0;
     }
-    if !qa.is_empty() && qa.split(['/', ',', '、', '&']).any(|a| !a.is_empty() && ca.contains(a)) {
+    if artist_ok(cand_artists, q) {
         s += 4.0;
     }
     if q.duration > 0.0 && cand_dur > 0.0 {
@@ -206,12 +252,12 @@ fn score(cand_title: &str, cand_artists: &str, cand_dur: f64, q: &Query) -> f64 
     s
 }
 
-fn netease(q: &Query) -> Option<(String, Option<String>)> {
+fn netease(q: &Query) -> Option<Hit> {
     const REF: &str = "https://music.163.com/";
-    let url = format!("https://music.163.com/api/cloudsearch/pc?s={}&type=1&limit=10", encode(&format!("{} {}", q.title, q.artist)));
+    let url = format!("https://music.163.com/api/cloudsearch/pc?s={}&type=1&limit=10", encode(&simplify(&format!("{} {}", q.title, q.artist))));
     let json = JsonObject::Parse(&HSTRING::from(get(&url, Some(REF)).ok()?)).ok()?;
     let songs: JsonArray = json.GetNamedObject(h!("result")).ok()?.GetNamedArray(h!("songs")).ok()?;
-    let mut best: Option<(f64, f64)> = None;
+    let mut best: Option<(f64, f64, bool)> = None;
     for i in 0..songs.Size().ok()? {
         let Ok(s) = songs.GetObjectAt(i) else { continue };
         let id = s.GetNamedNumber(h!("id")).unwrap_or(0.0);
@@ -228,11 +274,11 @@ fn netease(q: &Query) -> Option<(String, Option<String>)> {
         }
         let sc = score(&name, &artists, dur, q);
         if best.is_none_or(|b| sc > b.0) {
-            best = Some((sc, id));
+            best = Some((sc, id, artist_ok(&artists, q)));
         }
     }
-    let (sc, id) = best?;
-    if sc < 3.0 {
+    let (sc, id, artist_ok) = best?;
+    if sc < ACCEPT {
         return None;
     }
     let url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&tv=-1");
@@ -245,13 +291,14 @@ fn netease(q: &Query) -> Option<(String, Option<String>)> {
         .map(|h| h.to_string_lossy())
         .filter(|s| !s.trim().is_empty());
     // 纯音乐、没有时间轴的不要
-    (lrc.contains('[') && !lrc.contains("纯音乐，请欣赏")).then_some((lrc, tl))
+    (lrc.contains('[') && !lrc.contains("纯音乐，请欣赏")).then_some(Hit { score: sc, artist_ok, lrc, tlrc: tl })
 }
 
-fn lrclib(q: &Query) -> Option<String> {
-    let url = format!("https://lrclib.net/api/search?track_name={}&artist_name={}", encode(q.title), encode(q.artist));
+fn lrclib(q: &Query) -> Option<Hit> {
+    // 中文歌在 LRCLIB 上多是简体歌名 + 中文歌手名，繁体查不到
+    let url = format!("https://lrclib.net/api/search?track_name={}&artist_name={}", encode(&simplify(q.title)), encode(&simplify(q.artist)));
     let arr = JsonArray::Parse(&HSTRING::from(get(&url, None).ok()?)).ok()?;
-    let mut best: Option<(f64, String)> = None;
+    let mut best: Option<Hit> = None;
     for i in 0..arr.Size().ok()? {
         let Ok(s) = arr.GetObjectAt(i) else { continue };
         let Ok(synced) = s.GetNamedString(h!("syncedLyrics")) else { continue };
@@ -259,11 +306,11 @@ fn lrclib(q: &Query) -> Option<String> {
         let artist = s.GetNamedString(h!("artistName")).map(|h| h.to_string_lossy()).unwrap_or_default();
         let dur = s.GetNamedNumber(h!("duration")).unwrap_or(0.0);
         let sc = score(&name, &artist, dur, q);
-        if best.as_ref().is_none_or(|b| sc > b.0) {
-            best = Some((sc, synced.to_string_lossy()));
+        if best.as_ref().is_none_or(|b| sc > b.score) {
+            best = Some(Hit { score: sc, artist_ok: artist_ok(&artist, q), lrc: synced.to_string_lossy(), tlrc: None });
         }
     }
-    best.filter(|b| b.0 >= 3.0).map(|b| b.1)
+    best.filter(|b| b.score >= ACCEPT)
 }
 
 #[cfg(test)]
@@ -307,6 +354,33 @@ mod tests {
         let cover = score("晴天 (原唱 周杰伦)", "RyaVocal/", 270.7, &q);
         let female = score("晴天 (女声版)", "GYBeat/", 268.7, &q);
         assert!(original > cover && original > female);
+    }
+
+    /// Spotify 给的是繁体（說好不哭 / 周杰倫），网易云是简体：原唱要胜过时长恰好接近的翻唱，
+    /// 歌名对不上的歌不管时长多接近都不能通过。
+    #[test]
+    fn scoring_handles_traditional_chinese() {
+        let q = Query { title: "說好不哭", artist: "周杰倫", duration: 220.7 };
+        let original = score("说好不哭 (with 五月天阿信)", "周杰伦/阿信/", 222.0, &q);
+        let cover = score("说好不哭", "黑胶放映厅/", 219.9, &q);
+        let other = score("刀马旦", "周杰伦/李玟/", 220.5, &q);
+        assert!(original >= ACCEPT && original > cover, "original={original} cover={cover}");
+        assert!(other < ACCEPT, "other={other}");
+        assert_eq!(simplify("說好不哭 周杰倫"), "说好不哭 周杰伦");
+    }
+
+    /// 网易云没有原唱、只搜到翻唱时，要去 LRCLIB 找原唱；先问的来源歌手对得上就不再问第二个。
+    #[test]
+    fn prefers_other_source_over_cover() {
+        let q = Query { title: "說好不哭", artist: "周杰倫", duration: 220.7 };
+        let hit = |title: &str, artist: &str, dur: f64, lrc: &str| Hit { score: score(title, artist, dur, &q), artist_ok: artist_ok(artist, &q), lrc: lrc.into(), tlrc: None };
+        let cover = hit("说好不哭", "黑胶放映厅/", 219.9, "cover");
+        let original = hit("说好不哭 (with 五月天阿信)", "周杰伦", 221.0, "original");
+        assert_eq!(pick(Some(cover), || Some(original)).unwrap().lrc, "original");
+        let cover = hit("说好不哭", "黑胶放映厅/", 219.9, "cover");
+        assert_eq!(pick(Some(cover), || None).unwrap().lrc, "cover");
+        let original = hit("说好不哭 (with 五月天阿信)", "周杰伦/阿信/", 222.0, "original");
+        assert_eq!(pick(Some(original), || panic!("不该再查")).unwrap().lrc, "original");
     }
 
     #[test]
