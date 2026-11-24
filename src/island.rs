@@ -49,6 +49,10 @@ const HOVER_DELAY: Duration = Duration::from_millis(140);
 const LEAVE_DELAY: Duration = Duration::from_millis(320);
 const PAUSED_LINGER: Duration = Duration::from_secs(30);
 const LYRIC_ANIM: f32 = 0.28;
+/// 收起时鼠标指上去，岛先鼓起来这么多。
+const HOVER_LIFT: f32 = 1.04;
+/// 翻页时内容滑动的距离。
+const SLIDE: f32 = 26.0;
 
 const BLACK: Color = rgba(0.0, 0.0, 0.0, 1.0);
 const WHITE: Color = rgba(1.0, 1.0, 1.0, 1.0);
@@ -248,6 +252,14 @@ enum Btn {
     CopyNote(usize),
     DelNote(usize),
     SetCity,
+    /// 点封面或歌名：把播放器切到前台。
+    OpenPlayer,
+    /// 点歌词：从这一句开头重听。
+    Lyric,
+    /// 点时钟：打开系统「时钟」。
+    OpenClock,
+    /// 点电量：打开电源和电池设置。
+    OpenBattery,
 }
 
 /// 岛上弹出的输入框是用来输入什么的。
@@ -271,7 +283,13 @@ enum PressOn {
     Close(u64),
     Seek,
     Bubble,
+    Btn(Btn),
     Other,
+}
+
+/// 按钮按下的弹簧：欠阻尼，松手时会略微弹过头。
+fn squish_spring() -> Spring {
+    Spring::new(0.0, 0.22, 0.55)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -363,12 +381,29 @@ pub struct Island {
     icons: HashMap<u64, Image>,
     tiles: Vec<Tile>,
     drop_hover: bool,
-    hovered_tile: Option<u64>,
+    /// 指着的文件格子，和是否指在它的关闭按钮上。
+    hovered_tile: Option<(u64, bool)>,
     press_on: Option<(PressOn, f32, f32)>,
     /// 要拖出去的文件 id，由主循环在借用之外发起拖放。
     pending_drag: Option<u64>,
 
     buttons: Vec<(Btn, Rect)>,
+    /// 鼠标正指着的按钮（可能有嵌套，比如便签行里的删除）。
+    hot: Vec<Btn>,
+    /// 按钮悬停高亮的程度（0..1），指上去淡入、离开淡出。
+    glow: Vec<(Btn, f32)>,
+    /// 最后按下的按钮和它的按压程度（0..1，松手后弹回）。
+    squish: (Option<Btn>, Spring),
+    /// 进度条粗细：悬停或拖动时变粗。
+    bar_thick: Spring,
+    /// 小圆泡悬停时放大一点。
+    bubble_hot: Spring,
+    /// 当前帧内容的变换（岛的缩放、抖动、翻页滑动），按钮自己缩放时叠在它上面。
+    base: Matrix3x2,
+    /// 翻页方向（+1 往后、-1 往前、0 没在翻），内容跟着左右滑。
+    slide: f32,
+    /// 滚轮翻到头时岛左右轻轻一顶（水平位移）。
+    nudge: Spring,
     /// 调试：保持展开，不因鼠标离开而收起。
     pin: bool,
     /// 调试：用假的媒体信息，不跟系统同步。
@@ -441,6 +476,14 @@ impl Island {
             press_on: None,
             pending_drag: None,
             buttons: Vec::new(),
+            hot: Vec::new(),
+            glow: Vec::new(),
+            squish: (None, squish_spring()),
+            bar_thick: Spring::new(5.0, 0.25, 0.8),
+            bubble_hot: Spring::new(1.0, 0.3, 0.6),
+            base: Matrix3x2::identity(),
+            slide: 0.0,
+            nudge: Spring::new(0.0, 0.32, 0.45),
             pin: false,
             fake_media: false,
             anim_t: 0.0,
@@ -526,7 +569,8 @@ impl Island {
     // ---------- 鼠标 ----------
 
     pub fn on_mouse(&mut self, inside: bool, cursor: (f32, f32), now: Instant) {
-        if self.expanded && cursor != self.cursor && matches!(self.shown, Layout::ExpandedNotes { .. }) {
+        // 便签行的悬停、进度条上的时间气泡都跟着光标走
+        if self.expanded && cursor != self.cursor && (matches!(self.shown, Layout::ExpandedNotes { .. }) || self.bar_hover) {
             self.dirty = true;
         }
         self.cursor = cursor;
@@ -536,10 +580,14 @@ impl Island {
             self.leave_since = None;
             return;
         }
-        let hovered = if inside { self.tile_at(cursor.0, cursor.1).map(|t| t.0) } else { None };
+        let hovered = if inside { self.tile_at(cursor.0, cursor.1) } else { None };
         if hovered != self.hovered_tile {
             self.hovered_tile = hovered;
             self.dirty = true;
+        }
+        // 收起时指上去先微微鼓起来，紧接着再展开
+        if !self.pressed {
+            self.press.target = if inside && !self.expanded { HOVER_LIFT } else { 1.0 };
         }
         let bar_hover = inside && self.seek_bar.is_some_and(|b| seek_zone(b).contains(cursor.0, cursor.1)) && self.info.can_seek;
         if bar_hover != self.bar_hover {
@@ -557,13 +605,13 @@ impl Island {
             if self.pressed {
                 self.pressed = false;
                 self.press.target = 1.0;
+                self.squish.1.target = 0.0;
             }
             if self.expanded && !self.pin && self.editing.is_none() {
                 let since = *self.leave_since.get_or_insert(now);
                 if now - since >= LEAVE_DELAY {
+                    // 页面和便签滚动位置都留着，下次展开还在这里
                     self.expanded = false;
-                    self.page = Page::Media;
-                    self.note_scroll = 0;
                     self.leave_since = None;
                 }
             }
@@ -584,6 +632,40 @@ impl Island {
         Some((t.id, t.close.contains(x, y)))
     }
 
+    /// 跳回当前这句歌词的开头。
+    fn replay_line(&mut self) {
+        let t = self.info.lyrics.as_ref().zip(self.lyric.idx).and_then(|(l, i)| l.lines.get(i)).map(|l| l.t);
+        if let Some(t) = t
+            && self.info.can_seek
+        {
+            // 稍微往后一点：播放器跳过去常常差几十毫秒，正好落在上一句末尾会闪一下上一句
+            let t = t + 0.05;
+            self.media.send(Cmd::Seek(t));
+            // 乐观更新：进度和歌词立刻跳回去
+            self.info.position = t;
+            self.info.sampled_at = Some(Instant::now());
+        }
+    }
+
+    /// 展开态下 (x, y) 处的按钮（嵌套时取先画的那个，和点击判定一致）。
+    fn btn_at(&self, x: f32, y: f32) -> Option<Btn> {
+        if !self.expanded {
+            return None;
+        }
+        self.buttons.iter().find(|(_, r)| r.contains(x, y)).map(|b| b.0)
+    }
+
+    /// 光标在这里时显示成手形：点了会有反应的地方。
+    pub fn clickable(&self, x: f32, y: f32) -> bool {
+        if self.scrub.is_some() || (!self.expanded && self.on_bubble(x, y)) {
+            return true;
+        }
+        self.expanded
+            && (self.btn_at(x, y).is_some()
+                || self.tile_at(x, y).is_some()
+                || (self.info.can_seek && self.seek_bar.is_some_and(|b| seek_zone(b).contains(x, y))))
+    }
+
     fn scrub_frac(&self, x: f32) -> f32 {
         self.seek_bar.map(|b| ((x - b.x) / b.w).clamp(0.0, 1.0)).unwrap_or(0.0)
     }
@@ -601,6 +683,12 @@ impl Island {
             PressOn::Seek
         } else if !self.expanded && self.on_bubble(x, y) {
             PressOn::Bubble
+        } else if let Some(b) = self.btn_at(x, y) {
+            if self.squish.0 != Some(b) {
+                self.squish = (Some(b), squish_spring());
+            }
+            self.squish.1.target = 1.0;
+            PressOn::Btn(b)
         } else {
             match self.tile_at(x, y) {
                 Some((id, true)) => PressOn::Close(id),
@@ -608,11 +696,13 @@ impl Island {
                 None => PressOn::Other,
             }
         };
-        // 按在文件或进度条上时岛不缩，免得跟着抖
+        // 按在按钮、文件或进度条上时岛不缩，只有按钮自己缩
         if on == PressOn::Other {
-            self.press.target = 0.96;
+            // 展开后岛很大，缩同样的比例会显得太猛
+            self.press.target = if self.expanded { 0.985 } else { 0.95 };
         }
         self.press_on = Some((on, x, y));
+        self.dirty = true;
         on_bar
     }
 
@@ -621,6 +711,10 @@ impl Island {
             self.scrub = Some(self.scrub_frac(x));
             self.dirty = true;
             return;
+        }
+        // 按着按钮移开：按钮先弹回，松手也不触发；移回来再按下去
+        if let Some((PressOn::Btn(b), ..)) = self.press_on {
+            self.squish.1.target = if self.btn_at(x, y) == Some(b) { 1.0 } else { 0.0 };
         }
         if let Some((PressOn::Tile(id), px, py)) = self.press_on
             && (x - px).hypot(y - py) >= DRAG_SLOP
@@ -658,8 +752,13 @@ impl Island {
         if j != i {
             self.page = pages[j];
             self.page_changed = Instant::now();
-            self.dirty = true;
+            self.slide = if j > i { 1.0 } else { -1.0 };
+        } else {
+            // 翻到头了：往滚动方向顶一下再弹回来
+            self.page_changed = now;
+            self.nudge.velocity += if delta < 0 { -170.0 } else { 170.0 };
         }
+        self.dirty = true;
     }
 
     pub fn take_drag(&mut self) -> Option<PathBuf> {
@@ -694,7 +793,9 @@ impl Island {
         }
         self.pressed = false;
         self.press.target = 1.0;
+        self.squish.1.target = 0.0;
         let press = self.press_on.take();
+        self.dirty = true;
         if let Some(frac) = self.scrub.take() {
             let target = frac as f64 * self.info.duration;
             self.media.send(Cmd::Seek(target));
@@ -730,6 +831,12 @@ impl Island {
             _ => {}
         }
         let Some(&(b, _)) = self.buttons.iter().find(|(_, r)| r.contains(x, y)) else { return };
+        // 在一个按钮上按下、到另一个上松手，不算点击
+        if let Some((PressOn::Btn(a), ..)) = press
+            && a != b
+        {
+            return;
+        }
         match b {
             Btn::Prev => self.media.send(Cmd::Prev),
             Btn::Next => self.media.send(Cmd::Next),
@@ -748,12 +855,19 @@ impl Island {
             Btn::CancelTimer => self.timer = None,
             Btn::Page => {
                 let pages = self.pages();
-                self.page = pages[(self.page_index() + 1) % pages.len()];
+                let i = self.page_index();
+                let j = (i + 1) % pages.len();
+                self.page = pages[j];
                 self.page_changed = Instant::now();
+                self.slide = if j > i { 1.0 } else { -1.0 };
             }
             Btn::Swap => self.media.send(Cmd::Swap),
             Btn::NewNote => self.request_input(Input::Note),
             Btn::SetCity => self.request_input(Input::City),
+            Btn::OpenPlayer => system::focus_app(&self.info.app_id),
+            Btn::Lyric => self.replay_line(),
+            Btn::OpenClock => system::open_uri("ms-clock:"),
+            Btn::OpenBattery => system::open_uri("ms-settings:batterysaver"),
             Btn::CopyNote(i) => {
                 if let Some(t) = self.notes.items.get(i)
                     && notes::copy(t)
@@ -836,6 +950,7 @@ impl Island {
                     can_seek: true,
                     lyrics: Some(std::sync::Arc::new(crate::lyrics::build(lrc, None))),
                     track_id: 7,
+                    app_id: "Demo.exe".into(),
                     art: Some(std::sync::Arc::new(fake_art([255, 138, 101], [94, 53, 177]))),
                     ..Default::default()
                 };
@@ -1017,6 +1132,10 @@ impl Island {
         if target != self.target || split_changed {
             self.target = target;
             let (w, h, r) = self.dims_of(target);
+            let grow = w > self.w.target + 1.0 || h > self.h.target + 1.0;
+            let (resp, damp) = if grow { (0.44, 0.7) } else { (0.36, 0.9) };
+            self.w.tune(resp, damp);
+            self.h.tune(resp, (damp + 0.05).min(1.0));
             self.w.target = w;
             self.h.target = h;
             self.r.target = r;
@@ -1044,7 +1163,26 @@ impl Island {
             self.copied = None;
             self.dirty = true;
         }
-        for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press, &mut self.top, &mut self.split] {
+        // 按钮高亮：指着的淡入，离开的淡出（按钮位置用上一帧画出来的）
+        let (cx, cy) = self.cursor;
+        self.hot = if self.expanded { self.buttons.iter().filter(|(_, r)| r.contains(cx, cy)).map(|b| b.0).collect() } else { Vec::new() };
+        for &b in &self.hot {
+            if !self.glow.iter().any(|g| g.0 == b) {
+                self.glow.push((b, 0.0));
+            }
+        }
+        for (b, v) in &mut self.glow {
+            *v = if self.hot.contains(b) { (*v + dt / 0.08).min(1.0) } else { (*v - dt / 0.2).max(0.0) };
+        }
+        let hot = &self.hot;
+        self.glow.retain(|(b, v)| *v > 0.0 || hot.contains(b));
+        self.bar_thick.target = if self.scrub.is_some() || self.bar_hover { 8.0 } else { 5.0 };
+        self.bubble_hot.target = if !self.expanded && self.on_bubble(cx, cy) { 1.1 } else { 1.0 };
+
+        if self.shown == self.target && self.content_alpha >= 1.0 {
+            self.slide = 0.0;
+        }
+        for s in [&mut self.w, &mut self.h, &mut self.r, &mut self.press, &mut self.top, &mut self.split, &mut self.squish.1, &mut self.bar_thick, &mut self.bubble_hot, &mut self.nudge] {
             s.step(dt);
         }
         if let Some(l) = &mut self.level {
@@ -1087,7 +1225,10 @@ impl Island {
 
     fn animating(&self) -> bool {
         let level_moving = self.shown == Layout::Level && self.level.as_ref().is_some_and(|l| !l.fill.settled());
+        let fx = [&self.squish.1, &self.bar_thick, &self.bubble_hot, &self.nudge];
         !(self.w.settled() && self.h.settled() && self.r.settled() && self.press.settled() && self.top.settled() && self.split.settled())
+            || fx.iter().any(|s| !s.settled())
+            || self.glow.iter().any(|(b, v)| !self.hot.contains(b) || *v < 1.0)
             || self.shown != self.target
             || self.content_alpha < 1.0
             || level_moving
@@ -1150,7 +1291,9 @@ impl Island {
         let r = self.rect();
         let center = Vector2 { X: r.x + r.w / 2.0, Y: r.y + r.h / 2.0 };
         let s = self.press.value;
-        g.set_transform(Matrix3x2::scale_around(s, s, center));
+        let island = Matrix3x2::scale_around(s, s, center) * Matrix3x2::translation(self.nudge.value, 0.0);
+        self.base = island;
+        g.set_transform(island);
 
         let radius = self.r.value.min(r.h / 2.0).max(0.0);
         if let Some(b) = self.bubble_rect() {
@@ -1168,8 +1311,16 @@ impl Island {
         self.seek_bar = None;
         if a > 0.01 {
             // 形变途中内容不能溢出岛外；上下各让出圆角的一部分
-            let inset = (radius * 0.3).min(8.0);
+            // 形变结束后不再让，按钮的悬停底色才能完整画出来
+            let inset = (radius * 0.3).min(8.0) * (gap / 12.0).min(1.0);
             g.push_clip(Rect::new(r.x, r.y + inset, r.w, r.h - 2.0 * inset));
+            // 翻页：旧页往反方向滑出，新页从翻页方向滑入
+            if self.slide != 0.0 {
+                let k = 1.0 - self.content_alpha;
+                let dx = if self.shown != self.target { -self.slide } else { self.slide } * SLIDE * k * k;
+                self.base = Matrix3x2::translation(dx, 0.0) * island;
+                g.set_transform(self.base);
+            }
             match self.shown {
                 Layout::Idle { files, slim } => {
                     if files {
@@ -1193,6 +1344,9 @@ impl Island {
                 Layout::ExpandedDash { .. } => self.draw_dash(g, r, a),
                 Layout::ExpandedNotes { .. } => self.draw_notes(g, r, a),
             }
+            // 页码和暂存行不跟着翻页滑
+            self.base = island;
+            g.set_transform(island);
             if self.shown.is_expanded() {
                 self.draw_page_dots(g, r, a);
             }
@@ -1241,14 +1395,17 @@ impl Island {
         let ids: Vec<u64> = self.shelf.items.iter().map(|i| i.id).collect();
         for id in ids {
             let tile = Rect::new(x, y, TILE_W, 74.0);
-            let hovered = self.hovered_tile == Some(id);
-            if hovered {
-                g.fill_rrect(tile, 12.0, with_alpha(WHITE, 0.09 * a));
+            let hovered = self.hovered_tile.is_some_and(|t| t.0 == id);
+            let held = matches!(self.press_on, Some((PressOn::Tile(t), ..)) if t == id);
+            if hovered || held {
+                g.fill_rrect(tile, 12.0, with_alpha(WHITE, if held { 0.15 } else { 0.09 } * a));
             }
-            let icon = Rect::new(x + (TILE_W - 44.0) / 2.0, y + 6.0, 44.0, 44.0);
+            // 按住时图标缩一点，像被按下去
+            let k = if held { 40.0 } else { 44.0 };
+            let icon = Rect::new(x + (TILE_W - k) / 2.0, y + 6.0 + (44.0 - k) / 2.0, k, k);
             match self.icons.get(&id) {
                 Some(img) => g.draw_image(img, icon, 6.0, a),
-                None => self.draw_doc_glyph(g, icon.x + 12.0, icon.y + 8.0, 2.0, with_alpha(WHITE, 0.6 * a)),
+                None => self.draw_doc_glyph(g, icon.x + (k - 20.0) / 2.0, icon.y + (k - 26.0) / 2.0, k / 22.0, with_alpha(WHITE, 0.6 * a)),
             }
             let name = self.shelf.get(id).map(|i| i.name.as_str()).unwrap_or("");
             g.text(name, &g.fonts.tiny_center, Rect::new(x + 2.0, y + 54.0, TILE_W - 4.0, 16.0), with_alpha(WHITE, 0.8 * a));
@@ -1256,7 +1413,10 @@ impl Island {
             let close = Rect::new(x + TILE_W - 20.0, y + 1.0, 18.0, 18.0);
             if hovered {
                 let (cx, cy) = (close.x + 9.0, close.y + 9.0);
-                g.fill_rrect(close, 9.0, with_alpha(rgba(0.35, 0.35, 0.38, 1.0), a));
+                let on = self.hovered_tile == Some((id, true));
+                let held = matches!(self.press_on, Some((PressOn::Close(t), ..)) if t == id);
+                let d = if held { 15.0 } else { 18.0 };
+                g.fill_rrect(Rect::new(cx - d / 2.0, cy - d / 2.0, d, d), d / 2.0, with_alpha(if on { RED } else { rgba(0.35, 0.35, 0.38, 1.0) }, a));
                 let c = with_alpha(WHITE, a);
                 g.line((cx - 3.5, cy - 3.5), (cx + 3.5, cy + 3.5), 1.6, c);
                 g.line((cx - 3.5, cy + 3.5), (cx + 3.5, cy - 3.5), 1.6, c);
@@ -1266,11 +1426,39 @@ impl Island {
         }
     }
 
+    /// 按钮的悬停高亮程度（0..1）。
+    fn glow(&self, b: Btn) -> f32 {
+        self.glow.iter().find(|g| g.0 == b).map_or(0.0, |g| g.1)
+    }
+
+    /// 按钮被按下的程度（0..1）。
+    fn pressing(&self, b: Btn) -> f32 {
+        if self.squish.0 == Some(b) { self.squish.1.value.clamp(0.0, 1.0) } else { 0.0 }
+    }
+
+    /// 以 (cx, cy) 为中心，按这个按钮的按压程度缩小（弹回时略大于 1）。画完调 unsquish。
+    fn squish_at(&self, g: &Renderer, b: Btn, cx: f32, cy: f32) {
+        if self.squish.0 == Some(b) {
+            // 宽的按钮（整行歌词）缩同样比例会显得太猛，少缩一点
+            let depth = if b == Btn::Lyric { 0.035 } else { 0.12 };
+            let k = 1.0 - depth * self.squish.1.value;
+            g.set_transform(Matrix3x2::scale_around(k, k, Vector2 { X: cx, Y: cy }) * self.base);
+        }
+    }
+
+    fn unsquish(&self, g: &Renderer) {
+        g.set_transform(self.base);
+    }
+
     fn draw_page_dots(&mut self, g: &Renderer, r: Rect, a: f32) {
         let cx = r.x + r.w / 2.0;
         let y = r.y + 9.0;
         let (n, cur) = (self.pages().len(), self.page_index());
         let x0 = cx - (n as f32 * 10.0 - 5.0) / 2.0;
+        let glow = self.glow(Btn::Page);
+        if glow > 0.0 {
+            g.fill_rrect(Rect::new(x0 - 11.0, y - 5.5, n as f32 * 10.0 + 17.0, 16.0), 8.0, with_alpha(WHITE, 0.16 * glow * a));
+        }
         for i in 0..n {
             let x = x0 + i as f32 * 10.0;
             g.fill_rrect(Rect::new(x, y, 5.0, 5.0), 2.5, with_alpha(WHITE, if i == cur { 0.85 } else { 0.25 } * a));
@@ -1522,30 +1710,56 @@ impl Island {
     fn draw_expanded_media(&mut self, g: &Renderer, r: Rect, a: f32, lyric: u8) {
         let pad = 20.0;
         let art = Rect::new(r.x + pad, r.y + pad, 62.0, 62.0);
-        self.draw_art(g, art, 14.0, a);
-
         let tx = art.x + art.w + 14.0;
         let tw = r.x + r.w - pad - 34.0 - tx;
+        // 封面和歌名一起是个按钮：悬停时封面浮起一点、歌手名变亮，按下缩一下
+        let can_open = !self.info.app_id.is_empty();
+        let glow = self.glow(Btn::OpenPlayer);
+        self.squish_at(g, Btn::OpenPlayer, art.x + art.w / 2.0, art.y + art.h / 2.0);
+        self.draw_art(g, art.inflate(2.0 * glow), 14.0 + glow, a);
+        self.unsquish(g);
         g.text(&self.info.title, &g.fonts.title, Rect::new(tx, art.y + 8.0, tw, 22.0), with_alpha(WHITE, a));
-        g.text(&self.info.artist, &g.fonts.body, Rect::new(tx, art.y + 32.0, tw, 20.0), with_alpha(WHITE, 0.55 * a));
+        g.text(&self.info.artist, &g.fonts.body, Rect::new(tx, art.y + 32.0, tw, 20.0), with_alpha(WHITE, (0.55 + 0.3 * glow) * a));
         self.draw_bars(g, r.x + r.w - pad, art.y + 19.0, 16.0, a);
         if let Some(o) = &self.info.other {
             // 右上角：另一个播放器，点一下互换
             let chip = Rect::new(r.x + r.w - 34.0 - 104.0, r.y + 6.0, 104.0, 18.0);
-            g.fill_rrect(chip, 9.0, with_alpha(WHITE, 0.12 * a));
+            self.squish_at(g, Btn::Swap, chip.x + chip.w / 2.0, chip.y + chip.h / 2.0);
+            g.fill_rrect(chip, 9.0, with_alpha(WHITE, (0.12 + 0.16 * self.glow(Btn::Swap)) * a));
             let dot = Rect::new(chip.x + 4.0, chip.y + 3.0, 12.0, 12.0);
             match &self.other_art {
                 Some((_, img)) => g.draw_image(img, dot, 6.0, a),
                 None => g.fill_rrect(dot, 6.0, with_alpha(self.accent(), a)),
             }
             let label = format!("切到 {}", o.app);
-            g.text(&label, &g.fonts.small, Rect::new(chip.x + 21.0, chip.y, chip.w - 27.0, chip.h), with_alpha(WHITE, 0.8 * a));
+            g.text(&label, &g.fonts.small, Rect::new(chip.x + 21.0, chip.y, chip.w - 27.0, chip.h), with_alpha(WHITE, (0.8 + 0.2 * self.glow(Btn::Swap)) * a));
+            self.unsquish(g);
             self.buttons.push((Btn::Swap, chip.inflate(3.0)));
+        }
+        // 放在互换按钮后面，重叠处优先互换
+        if can_open {
+            self.buttons.push((Btn::OpenPlayer, Rect::new(art.x, art.y, tx + tw - art.x, art.h)));
         }
 
         let mut row_y = art.y + art.h + 14.0;
         if lyric > 0 {
             let two = lyric >= 2;
+            // 能跳进度、而且正唱到某一句时，歌词可以点：悬停垫底色、右边出个「重听」小图标，按下时整行轻轻缩一下
+            let row = Rect::new(r.x + pad - 6.0, row_y - 9.0, r.w - 2.0 * pad + 12.0, if two { 46.0 } else { 28.0 });
+            if self.info.can_seek && self.lyric.idx.is_some() {
+                let glow = self.glow(Btn::Lyric);
+                self.squish_at(g, Btn::Lyric, row.x + row.w / 2.0, row.y + row.h / 2.0);
+                if glow + self.pressing(Btn::Lyric) > 0.0 {
+                    g.fill_rrect(row, 12.0, with_alpha(WHITE, (0.1 * glow + 0.08 * self.pressing(Btn::Lyric)) * a));
+                    let (ix, iy) = (row.x + row.w - 16.0, row.y + 14.0);
+                    let ic = with_alpha(WHITE, 0.6 * glow * a);
+                    g.arc(ix, iy, 5.5, 0.78, 1.6, ic);
+                    // 圆弧从正上方顺时针画，箭头在起点往左指，像「倒回去」
+                    g.fill_poly(&[(ix + 0.5, iy - 8.5), (ix - 3.5, iy - 5.5), (ix + 0.5, iy - 2.5)], ic);
+                }
+                self.unsquish(g);
+                self.buttons.push((Btn::Lyric, row));
+            }
             self.draw_lyric(g, Rect::new(r.x + pad, row_y - 6.0, r.w - 2.0 * pad, 24.0), a, self.accent(), two);
             row_y += if two { LYRIC_ROW2 } else { LYRIC_ROW };
         }
@@ -1554,13 +1768,27 @@ impl Island {
                 Some(f) => f as f64 * self.info.duration,
                 None => self.info.position_now(),
             };
-            let thick = self.scrub.is_some() || self.bar_hover;
-            let bh = if thick { 8.0 } else { 5.0 };
+            let bh = self.bar_thick.value.max(3.0);
+            // 0..1：变粗的程度，悬停/拖动时进度条和时间都更亮
+            let hot = ((bh - 5.0) / 3.0).clamp(0.0, 1.0);
             let bar = Rect::new(r.x + pad + 40.0, row_y + 8.5 - bh / 2.0, r.w - 2.0 * pad - 80.0, bh);
-            g.fill_rrect(bar, bh / 2.0, with_alpha(WHITE, 0.18 * a));
+            g.fill_rrect(bar, bh / 2.0, with_alpha(WHITE, (0.18 + 0.06 * hot) * a));
             let p = (pos / self.info.duration).clamp(0.0, 1.0) as f32;
-            g.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * p).max(bh), bar.h), bh / 2.0, with_alpha(WHITE, 0.85 * a));
-            let lc = with_alpha(WHITE, 0.5 * a);
+            g.fill_rrect(Rect::new(bar.x, bar.y, (bar.w * p).max(bh), bar.h), bh / 2.0, with_alpha(WHITE, (0.85 + 0.15 * hot) * a));
+            if hot > 0.0 {
+                // 拖柄：随进度条变粗一起长出来，拖动时再大一点
+                let d = bh + 5.0 * hot + if self.scrub.is_some() { 2.0 } else { 0.0 };
+                let kx = bar.x + bar.w * p;
+                g.fill_rrect(Rect::new(kx - d / 2.0, bar.y + bh / 2.0 - d / 2.0, d, d), d / 2.0, with_alpha(WHITE, hot * a));
+                // 指着或拖动时，上方冒个小气泡显示那一点的时间
+                let f = self.scrub.unwrap_or(((self.cursor.0 - bar.x) / bar.w).clamp(0.0, 1.0));
+                let (tw, th) = (48.0, 20.0);
+                let tx = (bar.x + bar.w * f - tw / 2.0).clamp(r.x + pad, r.x + r.w - pad - tw);
+                let tip = Rect::new(tx, bar.y + bh / 2.0 - 34.0 + 4.0 * (1.0 - hot), tw, th);
+                g.fill_rrect(tip, th / 2.0, with_alpha(rgba(0.2, 0.2, 0.22, 1.0), hot * a));
+                g.text(&system::fmt_secs(f as f64 * self.info.duration), &g.fonts.small_center, tip, with_alpha(WHITE, hot * a));
+            }
+            let lc = with_alpha(WHITE, (0.5 + 0.3 * hot) * a);
             g.text(&system::fmt_secs(pos), &g.fonts.small, Rect::new(r.x + pad, row_y, 36.0, 17.0), lc);
             g.text(&format!("-{}", system::fmt_secs(self.info.duration - pos)), &g.fonts.small_right, Rect::new(r.x + r.w - pad - 40.0, row_y, 40.0, 17.0), lc);
             self.seek_bar = Some(Rect::new(bar.x, row_y + 6.0, bar.w, 5.0));
@@ -1571,6 +1799,13 @@ impl Island {
         let cx = r.x + r.w / 2.0;
         let c = with_alpha(WHITE, a);
         for (btn, bx) in [(Btn::Prev, cx - 64.0), (Btn::Toggle, cx), (Btn::Next, cx + 64.0)] {
+            // 悬停时背后浮出一个胶囊（离岛底边近，放不下圆），按下时整个按钮缩一下、底色更亮
+            let (glow, held) = (self.glow(btn), self.pressing(btn));
+            self.squish_at(g, btn, bx, cy);
+            if glow + held > 0.0 {
+                let w = if btn == Btn::Toggle { 58.0 } else { 54.0 };
+                g.fill_rrect(Rect::new(bx - w / 2.0, cy - 15.0, w, 30.0), 15.0, with_alpha(WHITE, (0.16 * glow + 0.1 * held) * a));
+            }
             match btn {
                 Btn::Toggle if self.info.playing => {
                     g.fill_rrect(Rect::new(bx - 7.5, cy - 9.0, 5.0, 18.0), 1.5, c);
@@ -1586,20 +1821,32 @@ impl Island {
                     g.fill_poly(&[(bx, cy - 7.0), (bx - 11.0, cy), (bx, cy + 7.0)], c);
                 }
             }
+            self.unsquish(g);
             self.buttons.push((btn, Rect::new(bx - 24.0, cy - 18.0, 48.0, 36.0)));
         }
     }
 
     /// 胶囊按钮。
     fn pill(&mut self, g: &Renderer, r: Rect, label: &str, c: Color, btn: Btn, a: f32) {
-        g.fill_rrect(r, r.h / 2.0, with_alpha(c, 0.18 * a));
+        self.squish_at(g, btn, r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let bg = 0.18 + 0.2 * self.glow(btn) + 0.1 * self.pressing(btn);
+        g.fill_rrect(r, r.h / 2.0, with_alpha(c, bg * a));
         g.text(label, &g.fonts.small_center, r, with_alpha(c, a));
+        self.unsquish(g);
         self.buttons.push((btn, r));
     }
 
     fn draw_dash(&mut self, g: &Renderer, r: Rect, a: f32) {
         let clock = system::clock();
         let pad = 24.0;
+        // 悬停底色贴着时间和日期的实际宽度，四周留 12 的边
+        let cw = g.text_width(&clock.time, &g.fonts.clock).max(g.text_width(&clock.date, &g.fonts.body) + 2.0).min(200.0);
+        let clock_area = Rect::new(r.x + pad - 12.0, r.y + 10.0, cw + 24.0, 78.0);
+        let glow = self.glow(Btn::OpenClock);
+        if glow > 0.0 {
+            g.fill_rrect(clock_area, 12.0, with_alpha(WHITE, 0.1 * glow * a));
+        }
+        self.buttons.push((Btn::OpenClock, clock_area));
         g.text(&clock.time, &g.fonts.clock, Rect::new(r.x + pad, r.y + 14.0, 160.0, 46.0), with_alpha(WHITE, a));
         g.text(&clock.date, &g.fonts.body, Rect::new(r.x + pad + 2.0, r.y + 58.0, 200.0, 22.0), with_alpha(WHITE, 0.55 * a));
         let right = r.x + r.w - pad;
@@ -1611,22 +1858,28 @@ impl Island {
             match &self.weather {
                 weather::State::Ready(n) => {
                     let (desc, icon) = (n.desc, n.icon);
-                    let temp = format!("{}°", n.temp.round() as i32);
-                    g.text(&temp, &g.fonts.title_right, Rect::new(right - 60.0, r.y + 18.0, 60.0, 24.0), with_alpha(WHITE, a));
-                    draw_weather_icon(g, right - 52.0, r.y + 30.0, icon, n.is_day, a);
                     let line = match &n.city {
                         Some(c) => format!("{c} · {desc}  {}° / {}°", n.lo.round() as i32, n.hi.round() as i32),
                         None => format!("{desc}  {}° / {}°", n.lo.round() as i32, n.hi.round() as i32),
                     };
-                    g.text(&line, &g.fonts.small_right, Rect::new(right - 200.0, r.y + 42.0, 200.0, 18.0), with_alpha(WHITE, 0.55 * a));
-                    // 按手动城市查的：点天气可以改城市
-                    if n.city.is_some() {
-                        self.buttons.push((Btn::SetCity, Rect::new(right - 200.0, r.y + 16.0, 200.0, 46.0)));
+                    // 点天气可以设置城市（自动定位的也能改成手动）；悬停底色贴着文字宽度。
+                    // 上边留给页码圆点（它的点击区到 r.y + 20），下边别碰到电量
+                    let tw = g.text_width(&line, &g.fonts.small_right).clamp(70.0, 200.0);
+                    let area = Rect::new(right - tw, r.y + 22.0, tw, 38.0);
+                    let glow = self.glow(Btn::SetCity);
+                    if glow > 0.0 {
+                        g.fill_rrect(Rect::new(area.x - 12.0, r.y + 14.0, tw + 24.0, 51.0), 12.0, with_alpha(WHITE, 0.1 * glow * a));
                     }
+                    let temp = format!("{}°", n.temp.round() as i32);
+                    g.text(&temp, &g.fonts.title_right, Rect::new(right - 60.0, r.y + 18.0, 60.0, 24.0), with_alpha(WHITE, a));
+                    draw_weather_icon(g, right - 52.0, r.y + 30.0, icon, n.is_day, a);
+                    g.text(&line, &g.fonts.small_right, Rect::new(right - 200.0, r.y + 42.0, 200.0, 18.0), with_alpha(WHITE, 0.55 * a));
+                    self.buttons.push((Btn::SetCity, area));
                 }
                 weather::State::NoLocation => {
                     let hint = Rect::new(right - 190.0, r.y + 22.0, 190.0, 18.0);
-                    g.text("定位不可用，点这里设置城市 ›", &g.fonts.small_right, hint, with_alpha(WHITE, 0.4 * a));
+                    let glow = self.glow(Btn::SetCity);
+                    g.text("定位不可用，点这里设置城市 ›", &g.fonts.small_right, hint, with_alpha(WHITE, (0.4 + 0.45 * glow) * a));
                     self.buttons.push((Btn::SetCity, hint.inflate(4.0)));
                 }
                 weather::State::Unknown => {}
@@ -1634,13 +1887,20 @@ impl Island {
         }
         if let Some(b) = self.battery {
             let bx = right - 26.0;
-            let cy = r.y + 69.0;
+            // 和上面天气的悬停底色错开一点
+            let cy = r.y + 74.0;
+            let area = Rect::new(bx - 62.0, cy - 13.0, 102.0, 26.0);
+            let glow = self.glow(Btn::OpenBattery);
+            if glow > 0.0 {
+                g.fill_rrect(area, 13.0, with_alpha(WHITE, 0.1 * glow * a));
+            }
             self.draw_battery(g, bx, cy, b, a);
             let c = if b.charging { GREEN } else { WHITE };
             g.text(&format!("{}%", b.percent), &g.fonts.small_right, Rect::new(bx - 52.0, cy - 9.0, 46.0, 18.0), with_alpha(c, a));
             if let Some(left) = system::battery_time() {
                 g.text(&system::fmt_left(left), &g.fonts.small_right, Rect::new(bx - 52.0 - 130.0, cy - 9.0, 126.0, 18.0), with_alpha(WHITE, 0.45 * a));
             }
+            self.buttons.push((Btn::OpenBattery, area));
         }
 
         // 计时器一行
@@ -1668,6 +1928,9 @@ impl Island {
     /// 另一个播放器的小圆泡：封面，没有封面时画个音符。
     fn draw_bubble(&self, g: &Renderer, b: Rect) {
         let s = self.split.value.clamp(0.0, 1.0);
+        // 悬停时放大一点，按下时缩回去
+        let k = self.bubble_hot.value * if matches!(self.press_on, Some((PressOn::Bubble, ..))) { 0.92 } else { 1.0 };
+        let b = Rect::new(b.x + b.w * (1.0 - k) / 2.0, b.y + b.h * (1.0 - k) / 2.0, b.w * k, b.h * k);
         g.fill_rrect(b, b.h / 2.0, BLACK);
         g.stroke_rrect(b.inflate(-0.5), b.h / 2.0, 1.0, rgba(1.0, 1.0, 1.0, 0.07));
         let inner = b.inflate(-5.0);
@@ -1694,11 +1957,13 @@ impl Island {
         }
         let add = Rect::new(r.x + r.w - pad - 26.0, r.y + 15.0, 26.0, 26.0);
         if !editing {
-            let hot = add.inflate(4.0).contains(self.cursor.0, self.cursor.1);
-            g.fill_rrect(add, 13.0, with_alpha(WHITE, if hot { 0.22 } else { 0.12 } * a));
             let (cx, cy) = (add.x + 13.0, add.y + 13.0);
+            self.squish_at(g, Btn::NewNote, cx, cy);
+            let bg = 0.12 + 0.16 * self.glow(Btn::NewNote) + 0.1 * self.pressing(Btn::NewNote);
+            g.fill_rrect(add, 13.0, with_alpha(WHITE, bg * a));
             g.line((cx - 5.5, cy), (cx + 5.5, cy), 1.8, with_alpha(WHITE, a));
             g.line((cx, cy - 5.5), (cx, cy + 5.5), 1.8, with_alpha(WHITE, a));
+            self.unsquish(g);
             self.buttons.push((Btn::NewNote, add.inflate(5.0)));
         }
 
@@ -1728,8 +1993,11 @@ impl Island {
             let i = *i;
             let row = note_row(r, first + k);
             let hover = !editing && row.contains(self.cursor.0, self.cursor.1);
-            if hover {
-                g.fill_rrect(row, 8.0, with_alpha(WHITE, 0.07 * a));
+            // 底色淡入淡出；指着删除按钮时整行也算悬停；按下去再亮一点
+            let glow = self.glow(Btn::CopyNote(i)).max(self.glow(Btn::DelNote(i)));
+            let bg = 0.11 * glow + 0.07 * self.pressing(Btn::CopyNote(i));
+            if bg > 0.0 {
+                g.fill_rrect(row, 8.0, with_alpha(WHITE, bg * a));
             }
             let cy = row.y + row.h / 2.0;
             g.fill_rrect(Rect::new(row.x + 9.0, cy - 3.0, 6.0, 6.0), 3.0, with_alpha(YELLOW, a));
@@ -1740,11 +2008,18 @@ impl Island {
                 g.text("复制", &g.fonts.small_right, Rect::new(row.x + row.w - 84.0, row.y, 50.0, row.h), with_alpha(WHITE, 0.4 * a));
                 let close = Rect::new(row.x + row.w - 26.0, cy - 9.0, 18.0, 18.0);
                 let (cx, ccy) = (close.x + 9.0, close.y + 9.0);
-                g.fill_rrect(close, 9.0, with_alpha(rgba(0.35, 0.35, 0.38, 1.0), a));
+                let del = Btn::DelNote(i);
+                self.squish_at(g, del, cx, ccy);
+                // 指着删除时变红，提示这一下会删掉
+                let k = self.glow(del);
+                let gray = [0.35, 0.35, 0.38];
+                let bg = rgba(gray[0] + (RED[0] - gray[0]) * k, gray[1] + (RED[1] - gray[1]) * k, gray[2] + (RED[2] - gray[2]) * k, 1.0);
+                g.fill_rrect(close, 9.0, with_alpha(bg, a));
                 let c = with_alpha(WHITE, a);
                 g.line((cx - 3.5, ccy - 3.5), (cx + 3.5, ccy + 3.5), 1.6, c);
                 g.line((cx - 3.5, ccy + 3.5), (cx + 3.5, ccy - 3.5), 1.6, c);
-                self.buttons.push((Btn::DelNote(i), close.inflate(4.0)));
+                self.unsquish(g);
+                self.buttons.push((del, close.inflate(4.0)));
             }
             if !editing {
                 self.buttons.push((Btn::CopyNote(i), row));

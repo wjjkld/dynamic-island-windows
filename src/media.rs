@@ -45,6 +45,8 @@ pub struct MediaInfo {
     pub accent: [f32; 3],
     /// 播放器名（Spotify、网易云音乐…）。
     pub app: String,
+    /// 播放器的 AppUserModelId，点封面时用它把播放器切到前台。
+    pub app_id: String,
     /// 另一个正在播放的播放器：显示成岛右边的小圆泡，点一下互换。
     pub other: Option<Other>,
     /// 每次有变化 +1，UI 线程据此判断要不要重新拷贝。
@@ -166,6 +168,18 @@ struct Ctx<'a> {
     lyrics_on: bool,
 }
 
+/// 跳进度后多久再读一次播放器的真实进度。
+const SEEK_RESYNC: Duration = Duration::from_millis(1500);
+
+/// 媒体线程最多等多久就醒来查一次：平时是兜底轮询，跳进度后要按时回来对一次进度。
+fn next_wait(playing: bool, resync_at: Option<Instant>, now: Instant) -> Duration {
+    let fallback = Duration::from_secs(if playing { 3 } else { 10 });
+    match resync_at {
+        Some(t) => fallback.min(t.saturating_duration_since(now)),
+        None => fallback,
+    }
+}
+
 fn request_lyrics(c: &Ctx, g: &MediaInfo) {
     if c.lyrics_on && g.active && !g.title.is_empty() {
         let _ = c.lyrics.send(LyricReq { track_id: g.track_id, title: g.title.clone(), artist: g.artist.clone(), duration: g.duration });
@@ -234,13 +248,16 @@ struct Subscription {
     session: Session,
     props: i64,
     playback: i64,
+    /// 进度变化（用户在播放器或手机上拖了进度），不等兜底轮询就对上
+    timeline: i64,
 }
 
 impl Subscription {
     fn new(session: Session, tx: &Sender<Cmd>) -> Result<Self> {
         let props = session.MediaPropertiesChanged(&notifier(tx))?;
         let playback = session.PlaybackInfoChanged(&notifier(tx))?;
-        Ok(Subscription { session, props, playback })
+        let timeline = session.TimelinePropertiesChanged(&notifier(tx))?;
+        Ok(Subscription { session, props, playback, timeline })
     }
 }
 
@@ -248,6 +265,7 @@ impl Drop for Subscription {
     fn drop(&mut self) {
         let _ = self.session.RemoveMediaPropertiesChanged(self.props);
         let _ = self.session.RemovePlaybackInfoChanged(self.playback);
+        let _ = self.session.RemoveTimelinePropertiesChanged(self.timeline);
     }
 }
 
@@ -269,10 +287,14 @@ fn run(mut c: Ctx) -> Result<()> {
     let mut primary: Option<Session> = None;
     let mut other: Option<Session> = None;
     let mut other_key = String::new();
+    // 跳进度后要强制对一次进度的时间点。UI 发跳进度时先把自己的进度改到目标（乐观更新），
+    // 播放器要是没跳（比如在手机上播、电脑端只是遥控），这边读到的进度没变就不会通知 UI，
+    // UI 会一直拿着错的进度，歌词也就再也对不上
+    let mut resync_at: Option<Instant> = None;
 
     loop {
         let playing = info.lock().map(|g| g.playing).unwrap_or(false);
-        let fallback = Duration::from_secs(if playing { 3 } else { 10 });
+        let fallback = next_wait(playing, resync_at, Instant::now());
         let mut current_changed = false;
         match rx.recv_timeout(fallback) {
             Ok(first @ (Cmd::Refresh | Cmd::CurrentChanged)) => {
@@ -319,7 +341,10 @@ fn run(mut c: Ctx) -> Result<()> {
                         Cmd::Toggle => s.TryTogglePlayPauseAsync(),
                         Cmd::Next => s.TrySkipNextAsync(),
                         Cmd::Prev => s.TrySkipPreviousAsync(),
-                        Cmd::Seek(sec) => s.TryChangePlaybackPositionAsync(((start + sec.max(0.0)) * 1e7) as i64),
+                        Cmd::Seek(sec) => {
+                            resync_at = Some(Instant::now() + SEEK_RESYNC);
+                            s.TryChangePlaybackPositionAsync(((start + sec.max(0.0)) * 1e7) as i64)
+                        }
                         Cmd::Refresh | Cmd::CurrentChanged | Cmd::Lyrics(_) | Cmd::Swap => unreachable!(),
                     };
                     if let Ok(op) = r {
@@ -375,6 +400,13 @@ fn run(mut c: Ctx) -> Result<()> {
                 }
             }
         };
+        if resync_at.is_some_and(|t| Instant::now() >= t) {
+            resync_at = None;
+            if let Ok(mut g) = info.lock() {
+                g.version += 1;
+                changed = true;
+            }
+        }
         if changed {
             (c.wake)();
         }
@@ -415,6 +447,7 @@ fn poll(session: &Session, wic: &IWICImagingFactory, c: &Ctx, last_key: &mut Str
     let artist = props.Artist()?.to_string_lossy();
     let pb = session.GetPlaybackInfo()?;
     let playing = pb.PlaybackStatus()? == Status::Playing;
+    let app = session.SourceAppUserModelId()?.to_string_lossy();
     let can_seek = pb.Controls().and_then(|c| c.IsPlaybackPositionEnabled()).unwrap_or(false);
 
     let tl = session.GetTimelineProperties()?;
@@ -433,7 +466,6 @@ fn poll(session: &Session, wic: &IWICImagingFactory, c: &Ctx, last_key: &mut Str
         }
     }
 
-    let app = session.SourceAppUserModelId()?.to_string_lossy();
     let key = format!("{app}\u{1}{title}\u{1}{artist}");
     let new_track = key != *last_key;
 
@@ -447,6 +479,7 @@ fn poll(session: &Session, wic: &IWICImagingFactory, c: &Ctx, last_key: &mut Str
 
     let mut g = info.lock().unwrap();
     g.app = app_name(&app);
+    g.app_id = app.clone();
     let before = (g.active, g.playing, g.title.clone(), g.artist.clone(), (g.duration as i64), g.can_seek);
     g.start = start;
     g.can_seek = can_seek;
@@ -538,6 +571,17 @@ pub fn accent_of(bgra: &[u8]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wakes_up_in_time_to_resync_after_seek() {
+        let now = Instant::now();
+        assert_eq!(next_wait(true, None, now), Duration::from_secs(3));
+        assert_eq!(next_wait(false, None, now), Duration::from_secs(10));
+        // 跳进度后 1.5 秒要回来对进度，不能等兜底轮询
+        assert_eq!(next_wait(false, Some(now + SEEK_RESYNC), now), SEEK_RESYNC);
+        // 已经过点了就立刻醒
+        assert_eq!(next_wait(true, Some(now), now + Duration::from_secs(1)), Duration::ZERO);
+    }
 
     #[test]
     fn app_names() {

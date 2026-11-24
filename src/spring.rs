@@ -24,6 +24,13 @@ impl Spring {
         }
     }
 
+    /// 换手感参数（同 new），保留当前位置和速度。
+    pub fn tune(&mut self, response: f32, damping_ratio: f32) {
+        let omega = 2.0 * PI / response;
+        self.stiffness = omega * omega;
+        self.damping = 2.0 * damping_ratio * omega;
+    }
+
     /// 半隐式欧拉，固定小步长积分，帧率波动时也稳定。
     pub fn step(&mut self, dt: f32) {
         const H: f32 = 1.0 / 240.0;

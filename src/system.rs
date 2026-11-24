@@ -169,3 +169,106 @@ mod tests {
         assert_eq!(fmt_secs(3600.0), "60:00");
     }
 }
+
+/// 用默认程序打开一个地址（ms-settings:、ms-clock: 之类）。
+pub fn open_uri(uri: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{HSTRING, w};
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(uri), None, None, SW_SHOWNORMAL);
+    }
+}
+
+/// 把正在放歌的播放器切到前台。先按进程名找它的主窗口；
+/// 找不到、又是商店应用时交给 shell:AppsFolder 激活（已经开着的会直接切过去）。
+pub fn focus_app(aumid: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow};
+    if aumid.is_empty() {
+        return;
+    }
+    if let Some(h) = exe_of(aumid).and_then(|exe| window_of(&exe)) {
+        unsafe {
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(h);
+        }
+        return;
+    }
+    if aumid.contains('!') {
+        open_uri(&format!("shell:AppsFolder\\{aumid}"));
+    }
+}
+
+/// AppUserModelId → 进程文件名（小写）。商店应用没法从 id 看出来，返回 None。
+fn exe_of(aumid: &str) -> Option<String> {
+    let l = aumid.to_lowercase();
+    const BROWSERS: [(&str, &str); 4] =
+        [("msedge", "msedge.exe"), ("chrome", "chrome.exe"), ("firefox", "firefox.exe"), ("308046b0af4a39cb", "firefox.exe")];
+    if let Some((_, exe)) = BROWSERS.iter().find(|(k, _)| l.contains(k)) {
+        return Some(exe.to_string());
+    }
+    if l.contains('!') {
+        return None;
+    }
+    let last = l.rsplit(['\\', '/']).next()?;
+    Some(if last.ends_with(".exe") { last.to_string() } else { format!("{last}.exe") })
+}
+
+/// 找某个进程的可见顶层窗口（按 Z 序，最近用过的在前）。
+fn window_of(exe: &str) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{CloseHandle, HWND};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+    use windows::core::PWSTR;
+
+    struct Find<'a> {
+        exe: &'a str,
+        found: Option<HWND>,
+    }
+    unsafe extern "system" fn each(h: HWND, data: LPARAM) -> BOOL {
+        let f = unsafe { &mut *(data.0 as *mut Find) };
+        unsafe {
+            if !IsWindowVisible(h).as_bool() || GetWindow(h, GW_OWNER).is_ok_and(|o| !o.is_invalid()) || GetWindowTextLengthW(h) == 0 {
+                return true.into();
+            }
+            let mut pid = 0;
+            GetWindowThreadProcessId(h, Some(&mut pid));
+            let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return true.into() };
+            let mut buf = [0u16; 520];
+            let mut n = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut n).is_ok();
+            let _ = CloseHandle(p);
+            if ok {
+                let path = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+                if path.rsplit('\\').next() == Some(f.exe) {
+                    f.found = Some(h);
+                    return false.into();
+                }
+            }
+        }
+        true.into()
+    }
+    let mut f = Find { exe, found: None };
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut f as *mut Find as isize));
+    }
+    f.found
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::exe_of;
+
+    #[test]
+    fn exe_names_from_app_ids() {
+        assert_eq!(exe_of("Spotify.exe").as_deref(), Some("spotify.exe"));
+        assert_eq!(exe_of("C:\\Program Files\\Foo\\Bar.EXE").as_deref(), Some("bar.exe"));
+        assert_eq!(exe_of("MSEdge").as_deref(), Some("msedge.exe"));
+        assert_eq!(exe_of("cloudmusic").as_deref(), Some("cloudmusic.exe"));
+        assert_eq!(exe_of("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"), None);
+    }
+}

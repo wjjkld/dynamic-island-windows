@@ -94,6 +94,8 @@ struct App {
     display_changed: Instant,
     last_sys: Instant,
     lbutton: bool,
+    /// 上次给光标设的是不是手形。
+    hand: bool,
     /// 左键是在窗口外按下的，现在按着进了窗口：可能是在拖文件过来。
     drag_candidate: bool,
 }
@@ -167,6 +169,7 @@ impl App {
             display_changed: Instant::now(),
             last_sys: Instant::now(),
             lbutton: false,
+            hand: false,
             drag_candidate: false,
         })
     }
@@ -312,6 +315,12 @@ impl App {
         let mut p = POINT::default();
         let _ = unsafe { GetCursorPos(&mut p) };
         let (x, y) = self.to_logical(p.x - self.origin.x, p.y - self.origin.y);
+        // 调试版 ISLAND_CURSOR=x,y：假装光标停在岛上这个位置（逻辑坐标），截悬停效果用，不用动真鼠标
+        #[cfg(debug_assertions)]
+        let (x, y) = std::env::var("ISLAND_CURSOR")
+            .ok()
+            .and_then(|v| v.split_once(',').and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?))))
+            .unwrap_or((x, y));
         let in_window = (0.0..WIN_W).contains(&x) && (0.0..WIN_H).contains(&y);
         let inside = self.island.hit(x, y);
 
@@ -341,6 +350,17 @@ impl App {
             match NoteInput::open(self.hwnd, x, y, px(r.w), px(r.h), self.scale, &initial) {
                 Some(input) => self.note_input = Some((kind, input)),
                 None => self.island.end_input(kind, None),
+            }
+        }
+
+        // 光标不动、底下的东西变了（岛悬停展开、翻页）时系统不会重设光标，这里补上
+        let hand = inside && self.island.clickable(x, y);
+        if hand != self.hand {
+            self.hand = hand;
+            if inside
+                && let Ok(c) = unsafe { LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }) }
+            {
+                unsafe { SetCursor(Some(c)) };
             }
         }
 
@@ -541,6 +561,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 }
             });
             return LRESULT(0);
+        }
+        WM_SETCURSOR if (lp.0 & 0xffff) as u32 == HTCLIENT => {
+            // 指着能点的东西时显示手形
+            let hand = with_app(|a| {
+                let mut p = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut p) };
+                let (x, y) = a.to_logical(p.x - a.origin.x, p.y - a.origin.y);
+                a.island.clickable(x, y)
+            });
+            if hand == Some(true)
+                && let Ok(c) = unsafe { LoadCursorW(None, IDC_HAND) }
+            {
+                unsafe { SetCursor(Some(c)) };
+                return LRESULT(1);
+            }
         }
         WM_CAPTURECHANGED => {
             // 捕获被别人抢走：当作松手

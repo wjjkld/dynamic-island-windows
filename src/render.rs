@@ -268,6 +268,20 @@ impl Renderer {
         }
     }
 
+    /// 文字排出来有多宽（逻辑像素），用来让悬停底色贴合文字。
+    pub fn text_width(&self, s: &str, fmt: &IDWriteTextFormat) -> f32 {
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let Ok(dw) = DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) else { return 0.0 };
+            let Ok(layout) = dw.CreateTextLayout(&wide, fmt, 4096.0, 100.0) else { return 0.0 };
+            let mut m = DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&mut m).is_err() {
+                return 0.0;
+            }
+            m.widthIncludingTrailingWhitespace
+        }
+    }
+
     /// 把 BGRA 预乘像素做成可画的图像（用于专辑封面）。
     pub fn image(&self, bgra: &[u8], side: u32) -> Result<Image> {
         unsafe {
